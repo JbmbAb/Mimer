@@ -1,0 +1,36 @@
+# Local secrets and machine-specific files
+.env
+03_Databas_PostGIS/docker/.env.postgis
+*.local
+
+# Google Drive and temporary working files
+.tmp.driveupload/
+tmp_pdf_preview/
+.quarantine/
+.git_failed_add_backup_*/
+
+# Large data/reference archives kept outside Git
+Kartor/
+Geodata/
+Bolagsverket/
+Examensarbete_Referens/
+Juridik_Referens/
+Mallar_Ingest/
+# Miljöbeslut.se/
+Miljölut.se/
+# Miljobeslut_Ops_Pipeline/
+
+# Large binary/source files
+*.zip
+*.pdf
+*.oxps
+*.sql
+03_Databas_PostGIS/backups/
+03_Databas_PostGIS/snapshots/
+03_Databas_PostGIS/docker/pgdata_live/
+03_Databas_PostGIS/pipeline/downloads/
+03_Databas_PostGIS/pipeline/extracted/
+03_Databas_PostGIS/pipeline/logs/
+
+# Generated logs/status samples
+status_sample.txt

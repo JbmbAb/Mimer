@@ -1,0 +1,27 @@
+# Kor fran denna katalog sa ./pgdata_live alltid pekar pa ratt volym (helst pa C:).
+# Start: docker compose --env-file .env.postgis up -d
+# Obs: D:-bind kan ge "no space" i containern om D: inte ar korrekt delad i Docker Desktop.
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: miljobeslut-postgis-live
+    ports:
+      - "55432:5432"
+    env_file:
+      - .env.postgis
+    environment:
+      # OPTIMERING FOR STABIL OCH SNABB IMPORT
+      POSTGRES_INITDB_ARGS: "-c shared_buffers=2GB -c effective_cache_size=8GB -c work_mem=50MB -c maintenance_work_mem=512MB -c max_parallel_workers_per_gather=4 -c max_parallel_workers=8 -c max_wal_size=4GB -c checkpoint_timeout=30min -c wal_buffers=16MB -c fsync=off -c synchronous_commit=off"
+    volumes:
+      - type: bind
+        source: ./pgdata_live
+        target: /var/lib/postgresql/data
+      - type: bind
+        source: D:/MiljoBeslut_Produktdata_Sources
+        target: /data_sources
+        read_only: true
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: '4'
+    shm_size: 2gb

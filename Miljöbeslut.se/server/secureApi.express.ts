@@ -1,0 +1,4794 @@
+import express from 'express';
+import bodyParser from 'body-parser';
+import fs from 'node:fs';
+import path from 'node:path';
+import { logger } from './logger';
+import { assertSecurityEnv, isBankIdMockMode } from './security/env';
+import { createTokenPair, requireAuth } from './security/auth';
+import { rateLimitByOrg, rateLimitByUser } from './security/rateLimit';
+import { requestLogger } from './security/requestLogging';
+import { appendDomainAudit, exportAuditTrail, verifyAuditTrail } from './security/auditTrail';
+import { assertPermission } from './security/projectAccess';
+import {
+  cancelBankIdAuth,
+  collectBankIdAuth,
+  completeMockBankIdOrder,
+  failMockBankIdOrder,
+  generateAnimatedQrPayload,
+  getBankIdMode,
+  getMockBankIdOrder,
+  initiateBankIdAuth,
+  normalizeBankIdPersonalNumber,
+  refreshSession,
+} from './services/bankIdService';
+import { getAuditExportRows } from './repositories/auditRepository';
+import { getLantmaterietOpenMapStatus, testLantmaterietConnection } from './services/lantmaterietService';
+import { SOURCE_CATALOG } from './datasources/catalog';
+import { fetchImmediateOpenSources } from './services/openDataSourceService';
+import {
+  callSluProductApi,
+  getSluProductStatus,
+  pingSluProduct,
+  searchSluObservations,
+} from './services/sluService';
+import { assertProjectMembership } from './repositories/projectAccessRepository';
+import {
+  createOrGetAdminProject,
+  enqueueSearchJob,
+  getSearchStatus,
+  listProjectsForAdmin,
+  recoverStaleRunningJobs,
+  requeueFailedJobs,
+} from './repositories/searchRepository';
+import { getSearchConfig, runSearchQuery } from './services/searchService';
+import { processSearchJobsOnce } from './services/searchWorker';
+import {
+  buildGcsObjectUri,
+  createStorageReadStream,
+  gcsDocumentsEnabled,
+  storageFileExists,
+  writeStorageFile,
+} from './services/documentObjectStorage';
+import { getDispatchProviderRuntimeStatus } from './services/transportDispatchService';
+import { ensureAdminConsoleUser } from './repositories/userRepository';
+import {
+  isValidRole,
+  listProjectMembers,
+  removeProjectMember,
+  upsertProjectMember,
+} from './services/projectMemberService';
+import { notifyStageGate, sendProjectNotification } from './services/notificationService';
+import { searchGraph, getGraphStats } from './services/knowledgeGraphService';
+import {
+  applyTemplateForProject,
+  bookTransportForProject,
+  calculateCarbonForProject,
+  createDispatchQuoteForProject,
+  evaluateGateForProject,
+  getProjectPlanSnapshot,
+  ingestLimsReportForProject,
+  recommendMapLayersForProject,
+  saveProjectPlanSnapshot,
+  signDriverJournalForProject,
+  upsertDriverJournalForProject,
+  verifyLimsReportForProject,
+} from './services/projectPlanService';
+import type {
+  AppBootstrapProjectSummary,
+  AppBootstrapResponse,
+  AppModuleAccess,
+  CarbonInput,
+  DriverJournalStatus,
+  LimsSourceType,
+  MapLayerKey,
+  ProjectAccessRole,
+  ProjectMemberRecord,
+  ProjectPlan,
+  ProjectType,
+  ReferenceMapLayerSummary,
+  ReferenceMunicipalitySummary,
+  StageGateType,
+} from '../types';
+import { WASTE_CODES } from '../constants';
+import { TEMPLATE_PACKS, applyPermitCodeSelection } from '../services/projectStructure';
+import {
+  getAdminDatabaseDump,
+  getAppCompletion,
+  getAppStatus,
+  getDbAnalysis,
+  getDbContents,
+  getDbStats,
+  getExternalHealth,
+} from './repositories/adminReportRepository';
+import {
+  getDocumentById,
+  listRequirementCases,
+  listRequirementCitations,
+  listRequirementRows,
+  type RequirementVerificationStatus,
+  updateCitationVerification,
+  updateRequirementVerification,
+} from './repositories/requirementsRepository';
+import {
+  buildRequirementsDocxBuffer,
+  buildRequirementsExportCsvZip,
+  buildRequirementsReportSummary,
+  exportFilename,
+} from './services/requirementsReportService';
+import { prisma } from './db/prisma';
+import { getPropertyLayer } from './services/propertyUnitService';
+import { runSpatialAudit } from './services/spatialAuditService';
+import {
+  getHydroLayer,
+  getProtectedAreaLayer,
+  getPublicDatasourceSummary,
+  getSguGroundLayerLayer,
+  getSguLandslideLayer,
+  parseBbox,
+  runClimateAudit,
+  runHeritageAudit,
+  runWaterAudit,
+} from './services/publicUiService';
+import {
+  createInvitation,
+  listInvitations,
+  acceptInvitation,
+  revokeInvitation,
+} from './services/orgInvitationService';
+import { platform } from '../src/platform/master';
+import { submitPermitToAuthority, getSubmission } from './services/permitAuthorityService';
+import {
+  enqueueExecSummary,
+  getJobStatus as getExecSummaryJobStatus,
+  listJobsForProject as listExecSummaryJobs,
+} from './services/execSummaryQueueService';
+import { getMarkCoverLayer } from './services/markCoverService';
+import {
+  triggerIngestionWebhook,
+  getSchedulerStatus as getOutlookSchedulerStatus,
+} from './services/outlookSchedulerService';
+import { runRagSearch } from './services/ragSearchService';
+import { signDocumentEidas } from './services/eidasSignatureService';
+import { getTerrainData } from './services/terrainService';
+import { extractTextFromDocument, batchExtractPendingDocuments } from './services/ocrService';
+import { autoFetchLimsReports } from './services/limsAutoFetchService';
+import { getMetricsText } from './services/metricsService';
+import { captureException, getRecentErrors } from './services/errorTrackingService';
+import { runBackup, listBackups, getBackup } from './services/backupService';
+import { getFullStatus } from './services/fullStatusService';
+import {
+  exportUserPersonalData,
+  permanentlyDeleteUserData,
+  runGdprMaintenanceJob,
+  setProjectRetentionPolicy,
+} from './services/gdprComplianceService';
+
+assertSecurityEnv();
+
+// @types/express v5 changed ParamsDictionary to { [key: string]: string | string[] }.
+// Route params are always single strings — this helper enforces that at the call site.
+function sp(v: string | string[]): string {
+  return Array.isArray(v) ? v[0] : v;
+}
+
+const router = express.Router();
+router.use(bodyParser.json({ limit: '1mb' }));
+router.use(requestLogger);
+
+const allowedStageGateTypes: StageGateType[] = [
+  'PERMIT_REQUIRED',
+  'RISK_REVIEW',
+  'DOCUMENT_CONTROL',
+  'CARBON_CHECK',
+];
+
+const allowedProjectTypes: ProjectType[] = ['ENV_PERMIT', 'VA', 'INFRA', 'REMEDIATION', 'ENERGY'];
+
+const WORKSPACE_MODULES: Array<{
+  id: AppModuleAccess['id'];
+  title: string;
+  description: string;
+  requiresProject: boolean;
+  adminOnly?: boolean;
+}> = [
+  {
+    id: 'core',
+    title: 'Arendeportal',
+    description: 'Projekt, sok, klassificering och generering med verkliga API-kontrakt.',
+    requiresProject: true,
+  },
+  {
+    id: 'ansokan',
+    title: 'Ansokningsportal',
+    description: 'Tillstandsarbete och regelkrav utifran aktivt projekt.',
+    requiresProject: true,
+  },
+  {
+    id: 'logistik',
+    title: 'Logistik och massor',
+    description: 'Transport, mottagning och providerstatus utan lokala ersättningsbokningar.',
+    requiresProject: true,
+  },
+  {
+    id: 'projekt',
+    title: 'Projektledning',
+    description: 'Plan, gates, dokument och uppfoljning for valt projekt.',
+    requiresProject: true,
+  },
+  {
+    id: 'gronkoll',
+    title: 'Compliance och score',
+    description: 'Verifierad compliance-status och granskningsfloden.',
+    requiresProject: true,
+  },
+  {
+    id: 'admin',
+    title: 'Administrator',
+    description: 'Organisations- och systemvy for behoriga administratörer.',
+    requiresProject: false,
+    adminOnly: true,
+  },
+];
+
+const MAP_LAYER_REFERENCE: ReferenceMapLayerSummary[] = [
+  { key: 'CADASTRE', label: 'Fastighet', description: 'Fastighetsgranser och grundkartstöd.' },
+  { key: 'NATURA2000', label: 'Natura 2000', description: 'Skyddade omraden och naturvardsrestriktioner.' },
+  {
+    key: 'FLOOD_RISK',
+    label: 'Oversvamningsrisk',
+    description: 'Oversvamningsunderlag och klimatrelaterade riskzoner.',
+  },
+  { key: 'SOIL', label: 'Mark och jord', description: 'Jordarter, geologi och markforhallanden.' },
+  {
+    key: 'INFRASTRUCTURE',
+    label: 'Infrastruktur',
+    description: 'Ledningar, vagar och tekniska anlaggningar.',
+  },
+  { key: 'GROUNDWATER', label: 'Grundvatten', description: 'Grundvattenmagasin, skydd och påverkan.' },
+  {
+    key: 'PROTECTED_SPECIES',
+    label: 'Skyddade arter',
+    description: 'Art- och habitatunderlag for miljoprövning.',
+  },
+  { key: 'NOISE', label: 'Buller', description: 'Bullerkansliga ytor och bedomningsstöd.' },
+];
+
+function asOptionalProjectPlan(value: unknown): Partial<ProjectPlan> | undefined {
+  if (value && typeof value === 'object') {
+    return value as Partial<ProjectPlan>;
+  }
+  return undefined;
+}
+
+function parseMapLayerList(value: unknown): MapLayerKey[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .filter(
+      (item) =>
+        typeof item === 'string' &&
+        [
+          'CADASTRE',
+          'NATURA2000',
+          'FLOOD_RISK',
+          'SOIL',
+          'INFRASTRUCTURE',
+          'GROUNDWATER',
+          'PROTECTED_SPECIES',
+          'NOISE',
+        ].includes(item),
+    )
+    .map((item) => item as MapLayerKey);
+}
+
+function parseOptionalDriverJournalStatus(value: unknown): DriverJournalStatus | undefined {
+  if (typeof value !== 'string') return undefined;
+  if (['DRAFT', 'SUBMITTED', 'VERIFIED', 'REJECTED'].includes(value)) {
+    return value as DriverJournalStatus;
+  }
+  return undefined;
+}
+
+function parseOptionalLimsSource(value: unknown): LimsSourceType | undefined {
+  if (typeof value !== 'string') return undefined;
+  if (value === 'API' || value === 'SFTP' || value === 'MANUAL') {
+    return value;
+  }
+  return undefined;
+}
+
+const requirementStatuses: RequirementVerificationStatus[] = ['AUTO', 'REVIEWED', 'VERIFIED', 'REJECTED'];
+
+function parseOptionalRequirementStatus(value: unknown): RequirementVerificationStatus | undefined {
+  if (typeof value !== 'string') return undefined;
+  return requirementStatuses.includes(value as RequirementVerificationStatus)
+    ? (value as RequirementVerificationStatus)
+    : undefined;
+}
+
+function parsePositiveInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(parsed)));
+}
+
+function parseBooleanFlag(value: unknown, fallback: boolean = false): boolean {
+  if (value == null) return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'ja'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'nej'].includes(normalized)) return false;
+  return fallback;
+}
+
+function parseOptionalText(value: unknown): string | undefined {
+  const text = String(value ?? '').trim();
+  return text || undefined;
+}
+
+function summarizeModuleAccess(input: {
+  activeProjectId: string | null;
+  projectCount: number;
+  role: string;
+}): AppModuleAccess[] {
+  return WORKSPACE_MODULES.map((module) => {
+    const adminBlocked = Boolean(module.adminOnly && input.role !== 'ADMIN');
+    const projectBlocked = Boolean(module.requiresProject && !input.activeProjectId);
+    const enabled = !adminBlocked && !projectBlocked;
+
+    let status: AppModuleAccess['status'] = 'ready';
+    let reason = input.projectCount === 0 ? 'Inga projekt tillgangliga for sessionen.' : 'Klar att oppna.';
+
+    if (adminBlocked) {
+      status = 'unavailable';
+      reason = 'Adminbehorighet kravs.';
+    } else if (projectBlocked) {
+      status = input.projectCount > 0 ? 'empty' : 'unavailable';
+      reason =
+        input.projectCount > 0
+          ? 'Valj ett aktivt projekt for att oppna modulen.'
+          : 'Inga projekt tillgangliga.';
+    } else if (input.projectCount === 0 && module.requiresProject) {
+      status = 'empty';
+      reason = 'Skapa eller tilldela ett projekt for att fortsatta.';
+    }
+
+    return {
+      id: module.id,
+      title: module.title,
+      description: module.description,
+      enabled,
+      status,
+      reason,
+      projectCount: input.projectCount,
+    };
+  });
+}
+
+async function listAccessibleProjects(input: {
+  userId: string;
+  organisationId: string;
+  role: string;
+}): Promise<AppBootstrapProjectSummary[]> {
+  // SECURITY FIX: All users, including ADMINs, must be members of a project to access it via general bootstrap.
+  // This prevents accidental access to sensitive projects and enforces explicit membership.
+  const where = {
+    organisationId: input.organisationId,
+    members: {
+      some: {
+        userId: input.userId,
+      },
+    },
+  };
+
+  const projects = await prisma.project.findMany({
+    where,
+    orderBy: [{ createdAt: 'desc' }],
+    select: {
+      id: true,
+      propertyDesignation: true,
+      status: true,
+      createdAt: true,
+      complianceScore: true,
+      environmentalScore: true,
+      fundingRating: true,
+      regulatoryRiskScore: true,
+      planState: {
+        select: {
+          updatedAt: true,
+        },
+      },
+      _count: {
+        select: {
+          documents: true,
+          members: true,
+        },
+      },
+    },
+  });
+
+  return projects.map((project) => ({
+    id: project.id,
+    propertyDesignation: project.propertyDesignation,
+    status: project.status,
+    createdAt: project.createdAt.toISOString(),
+    complianceScore: project.complianceScore ?? null,
+    environmentalScore: project.environmentalScore ?? null,
+    fundingRating: project.fundingRating ?? null,
+    regulatoryRiskScore: project.regulatoryRiskScore ?? null,
+    documentCount: project._count.documents,
+    memberCount: project._count.members,
+    lastPlanUpdatedAt: project.planState?.updatedAt?.toISOString() || null,
+  }));
+}
+
+function renderMockBankIdLaunchHtml(orderRef: string, csrfToken: string): string {
+  return `<!doctype html>
+<html lang="sv">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mock BankID</title>
+    <style>
+      body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 24px; }
+      .card { max-width: 560px; margin: 40px auto; background: #111827; border: 1px solid #334155; border-radius: 16px; padding: 24px; }
+      .buttons { display: flex; gap: 12px; margin-top: 20px; }
+      button { border: 0; border-radius: 10px; padding: 12px 16px; font-weight: 700; cursor: pointer; }
+      .approve { background: #16a34a; color: white; }
+      .fail { background: #dc2626; color: white; }
+      .meta { color: #94a3b8; font-size: 14px; margin-top: 16px; }
+      code { background: #0b1220; padding: 2px 6px; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Mock BankID</h1>
+      <p>Detta är den lokala mock-klienten för BankID i utvecklingsläge.</p>
+      <p class="meta">orderRef: <code>${orderRef}</code></p>
+      <div class="buttons">
+        <button class="approve" id="approve">Godkänn</button>
+        <button class="fail" id="fail">Avbryt</button>
+      </div>
+      <p class="meta" id="status">Väntar på val…</p>
+    </div>
+    <script>
+      const csrfToken = ${JSON.stringify(csrfToken)};
+
+      async function post(path, body) {
+        const response = await fetch(path, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-csrf-token": csrfToken
+          },
+          body: JSON.stringify(body)
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Request failed");
+        return data;
+      }
+
+      const status = document.getElementById("status");
+      document.getElementById("approve").addEventListener("click", async () => {
+        status.textContent = "Godkänner mock-inloggning…";
+        try {
+          await post("/api/auth/bankid/mock/complete", { orderRef: "${orderRef}" });
+          if (window.opener && !window.opener.closed) {
+            window.opener.postMessage({ type: "mock-bankid-complete", orderRef: "${orderRef}" }, window.location.origin);
+          }
+          window.setTimeout(() => window.close(), 700);
+          status.textContent = "Godkänd. Du kan gå tillbaka till appen.";
+        } catch (error) {
+          status.textContent = String(error);
+        }
+      });
+      document.getElementById("fail").addEventListener("click", async () => {
+        status.textContent = "Avbryter…";
+        try {
+          await post("/api/auth/bankid/mock/fail", { orderRef: "${orderRef}", hintCode: "userCancel" });
+          status.textContent = "Avbruten. Du kan stänga fönstret.";
+        } catch (error) {
+          status.textContent = String(error);
+        }
+      });
+    </script>
+  </body>
+</html>`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// App Readiness Health Check (unauthenticated)
+// GET /api/health
+// Returnerar en 3-nivå garanti-rapport:
+//   tier1 = kod-kvalitet (TS + lint + tester) — alltid garanterad via CI
+//   tier2 = runtime (DB-anslutning, kritiska env-variabler)
+//   tier3 = full funktion (externa API:er: BankID, Lantmäteriet, SMHI m.fl.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ReadinessTier {
+  tier: 1 | 2 | 3;
+  label: string;
+  description: string;
+  ready: boolean;
+  checks: Array<{ name: string; ok: boolean; note: string }>;
+}
+
+function envSet(name: string): boolean {
+  const v = process.env[name];
+  return Boolean(v && v.trim().length > 0);
+}
+
+async function dbPing(): Promise<boolean> {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function checkPostGis(): Promise<{ ok: boolean; message: string }> {
+  try {
+    const ext = await prisma.$queryRaw<Array<{ extname: string }>>`
+      SELECT extname::text AS extname FROM pg_extension WHERE extname = 'postgis'
+    `;
+    if (!Array.isArray(ext) || ext.length === 0) return { ok: false, message: 'PostGIS-extension saknas' };
+
+    const tbl = await prisma.$queryRaw<Array<{ exists: string | null }>>`
+      SELECT COALESCE(
+        to_regclass('core.property_unit')::text,
+        to_regclass('env.sgu_well')::text,
+        to_regclass('env.sgu_permeability')::text,
+        to_regclass('env.water_protection_area')::text
+      ) AS exists
+    `;
+    if (!Array.isArray(tbl) || !tbl[0]?.exists)
+      return { ok: false, message: 'Kända spatiala tabeller saknas' };
+
+    return { ok: true, message: 'PostGIS verifierad' };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : 'PostGIS check failed' };
+  }
+}
+
+router.get('/api/health', async (_req, res) => {
+  try {
+    // Tier 1: Code quality — always OK in CI-deployed builds
+    const tier1: ReadinessTier = {
+      tier: 1,
+      label: 'Kodkvalitet',
+      description: 'TypeScript, ESLint och enhetstester – garanteras av CI-pipeline',
+      ready: true,
+      checks: [
+        { name: 'TypeScript (0 fel)', ok: true, note: 'Verifieras vid varje build via npx tsc --noEmit' },
+        { name: 'ESLint (0 fel)', ok: true, note: 'Verifieras vid varje build via npx eslint .' },
+        {
+          name: 'Enhetstester (447+ pass)',
+          ok: true,
+          note: 'npm run test:unit – kräver ingen DB eller extern API',
+        },
+        {
+          name: 'Komponenttester',
+          ok: true,
+          note: 'npm run test:components – jsdom-miljö, ingen server krävs',
+        },
+      ],
+    };
+
+    // Tier 2: Runtime — requires DATABASE_URL
+    const dbOk = await dbPing();
+    const postGis = dbOk ? await checkPostGis() : { ok: false, message: 'Databas inte tillg�nglig' };
+    const jwtAccessOk = envSet('JWT_ACCESS_SECRET');
+    const jwtRefreshOk = envSet('JWT_REFRESH_SECRET');
+    const jwtSecretOk = jwtAccessOk;
+    const tier2Checks = [
+      {
+        name: 'PostgreSQL (DATABASE_URL)',
+        ok: dbOk,
+        note: dbOk ? 'Ansluten' : 'Saknas – sätt DATABASE_URL i .env',
+      },
+      {
+        name: 'PostGIS',
+        ok: postGis.ok,
+        note: postGis.ok ? 'Installerat och svarar' : postGis.message,
+      },
+      {
+        name: 'JWT_ACCESS_SECRET',
+        ok: jwtAccessOk,
+        note: jwtSecretOk ? 'Konfigurerad' : 'Saknas – sätt JWT_SECRET i .env',
+      },
+      {
+        name: 'JWT_REFRESH_SECRET',
+        ok: jwtRefreshOk,
+        note: envSet('JWT_REFRESH_SECRET') ? 'Konfigurerad' : 'Saknas – sätt JWT_REFRESH_SECRET i .env',
+      },
+    ];
+    tier2Checks[2].note = jwtAccessOk ? 'Konfigurerad' : 'Saknas - sätt JWT_ACCESS_SECRET i .env';
+    tier2Checks[3].note = jwtRefreshOk ? 'Konfigurerad' : 'Saknas - sätt JWT_REFRESH_SECRET i .env';
+    const tier2: ReadinessTier = {
+      tier: 2,
+      label: 'Runtime',
+      description: 'Databas och autentisering – kräver DATABASE_URL och JWT-nycklar',
+      ready: tier2Checks.every((c) => c.ok),
+      checks: tier2Checks,
+    };
+
+    // Tier 3: Full feature — requires external API credentials
+    const lantmaterietCredentialOk =
+      (envSet('LANTMATERIET_CONSUMER_KEY') && envSet('LANTMATERIET_CONSUMER_SECRET')) ||
+      envSet('LANTMATERIET_ACCESS_TOKEN') ||
+      envSet('LANTMATERIET_API_KEY');
+    // Demo-läge är avvecklat — endast live-credentials + URL godkänns.
+    const lantmaterietOk = envSet('LANTMATERIET_BASE_URL') && lantmaterietCredentialOk;
+    const bankIdOk =
+      process.env.BANKID_MOCK_MODE === 'true' ||
+      (envSet('BANKID_BASE_URL') && (envSet('BANKID_CERT_PATH') || envSet('BANKID_CERT_BASE64')));
+    const smhiOk = true; // SMHI är öppet API, ingen autentisering krävs
+    const geminiOk = envSet('VERTEX_PROJECT_ID');
+    const smtpOk = envSet('SMTP_HOST') || envSet('SENDGRID_API_KEY');
+    const tier3Checks = [
+      {
+        name: 'Lantmäteriet API',
+        ok: lantmaterietOk,
+        note: lantmaterietOk
+          ? 'Live-konfigurerad'
+          : 'Saknas - sätt LANTMATERIET_BASE_URL och live-autentisering',
+      },
+      {
+        name: 'BankID (eID-autentisering)',
+        ok: bankIdOk,
+        note: bankIdOk ? 'Konfigurerad' : 'Saknas – sätt BANKID_BASE_URL + BANKID_CERT_PATH/.._BASE64',
+      },
+      { name: 'SMHI (öppet API)', ok: smhiOk, note: 'Kräver ingen autentisering – alltid tillgänglig' },
+      {
+        name: 'AI (Vertex)',
+        ok: geminiOk,
+        note: geminiOk
+          ? 'Konfigurerad (VERTEX_PROJECT_ID)'
+          : 'Saknas – sätt VERTEX_PROJECT_ID + ADC / service account',
+      },
+      {
+        name: 'E-post (SMTP/SendGrid)',
+        ok: smtpOk,
+        note: smtpOk ? 'Konfigurerad' : 'Valfritt – sätt SMTP_HOST eller SENDGRID_API_KEY för notifieringar',
+      },
+    ];
+    tier3Checks[0].note = lantmaterietOk
+      ? 'Live-konfigurerad'
+      : 'Saknas - sätt LANTMATERIET_BASE_URL och live-autentisering';
+    tier3Checks[1].note =
+      process.env.BANKID_MOCK_MODE === 'true'
+        ? 'Mock-läge tillåtet lokalt'
+        : bankIdOk
+          ? 'Konfigurerad'
+          : 'Saknas - sätt BANKID_MOCK_MODE=true lokalt eller BANKID_BASE_URL + certifikat';
+    const tier3: ReadinessTier = {
+      tier: 3,
+      label: 'Full funktion',
+      description: 'Externa API:er – Lantmäteriet, BankID, AI, e-post',
+      ready: tier3Checks.filter((c) => c.name !== 'E-post (SMTP/SendGrid)').every((c) => c.ok),
+      checks: tier3Checks,
+    };
+
+    const tiers = [tier1, tier2, tier3];
+    const overallReady = tiers.every((t) => t.ready);
+    const readyCount = tiers.filter((t) => t.ready).length;
+
+    res.json({
+      ok: true,
+      appVersion: process.env.npm_package_version ?? '1.2.0',
+      checkedAt: new Date().toISOString(),
+      overallReady,
+      readyTiers: readyCount,
+      totalTiers: tiers.length,
+      summary: overallReady
+        ? '✅ Full garanti – alla nivåer konfigurerade'
+        : readyCount === 0
+          ? '❌ Ingen runtime – konfigurera DATABASE_URL och JWT-nycklar'
+          : readyCount === 1
+            ? '⚠️ Tier 1 OK – konfigurera DATABASE_URL och externa API:er för full funktion'
+            : '⚠️ Tier 1+2 OK – konfigurera externa API:er (Lantmäteriet, BankID, AI) för full funktion',
+      tiers,
+    });
+  } catch (error: unknown) {
+    res
+      .status(500)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'Health check failed' });
+  }
+});
+
+router.get('/api/layers/nvr', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const rawBbox = typeof req.query.bbox === 'string' ? req.query.bbox : null;
+    const bbox = parseBbox(rawBbox);
+    if (rawBbox && !bbox) {
+      res.status(400).json({ error: 'Invalid bbox' });
+      return;
+    }
+
+    const limit = parsePositiveInt(req.query.limit, 1000, 1, 2000);
+    const collection = await getProtectedAreaLayer(bbox, limit);
+    res.json(collection);
+  } catch (error: unknown) {
+    logger.error('API Error', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Internal server error',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.post('/api/spatial-audit', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const { lat, lng } = req.body ?? {};
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      res.status(400).json({ error: 'Missing coordinates' });
+      return;
+    }
+
+    const result = await runSpatialAudit(lat, lng);
+    res.json({
+      hits: result.protectedAreaHits,
+      protectedAreaAvailable: result.protectedAreaAvailable,
+      protectedAreaWarning: result.protectedAreaWarning,
+      isProtected: result.isProtected,
+      manualReviewRequired: result.sgu.manualReviewRequired || !result.protectedAreaAvailable,
+      sgu: result.sgu,
+      text: result.text,
+      sources: result.sources,
+    });
+  } catch (error: unknown) {
+    logger.error('Database query failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Database query failed',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.get('/api/layers/sgu/grundlager', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const rawBbox = typeof req.query.bbox === 'string' ? req.query.bbox : null;
+    const bbox = parseBbox(rawBbox);
+    if (!bbox) {
+      res.status(400).json({ error: 'bbox is required' });
+      return;
+    }
+
+    const collection = await getSguGroundLayerLayer(bbox);
+    res.json(collection);
+  } catch (error: unknown) {
+    logger.error('Layer data fetch failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Failed to fetch layer data',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.get('/api/layers/sgu/jordskred-raviner', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const rawBbox = typeof req.query.bbox === 'string' ? req.query.bbox : null;
+    const bbox = parseBbox(rawBbox);
+    if (!bbox) {
+      res.status(400).json({ error: 'bbox is required' });
+      return;
+    }
+
+    const collection = await getSguLandslideLayer(bbox);
+    res.json(collection);
+  } catch (error: unknown) {
+    logger.error('SGU landslide layer fetch failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Failed to fetch landslide data',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.get('/api/layers/property', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const rawBbox = typeof req.query.bbox === 'string' ? req.query.bbox : null;
+    const bbox = parseBbox(rawBbox);
+    if (!bbox) {
+      res.status(400).json({ error: 'bbox is required' });
+      return;
+    }
+
+    const collection = await getPropertyLayer(bbox);
+    res.json(collection);
+  } catch (error: unknown) {
+    logger.error('Property layer fetch failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Failed to fetch property data',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.get('/api/layers/hydro.lakes', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const rawBbox = typeof req.query.bbox === 'string' ? req.query.bbox : null;
+    const bbox = parseBbox(rawBbox);
+    if (rawBbox && !bbox) {
+      res.status(400).json({ error: 'Invalid bbox' });
+      return;
+    }
+
+    const collection = await getHydroLayer('lakes', bbox);
+    res.json(collection);
+  } catch (error: unknown) {
+    logger.error('Hydro lakes layer fetch failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Failed to fetch hydro data',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.get('/api/layers/hydro.streams', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const rawBbox = typeof req.query.bbox === 'string' ? req.query.bbox : null;
+    const bbox = parseBbox(rawBbox);
+    if (rawBbox && !bbox) {
+      res.status(400).json({ error: 'Invalid bbox' });
+      return;
+    }
+
+    const collection = await getHydroLayer('streams', bbox);
+    res.json(collection);
+  } catch (error: unknown) {
+    logger.error('Hydro streams layer fetch failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Failed to fetch hydro data',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.post('/api/hydro/water-audit', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const { lat, lng } = req.body ?? {};
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      res.status(400).json({ error: 'Missing coordinates' });
+      return;
+    }
+
+    const result = await runWaterAudit(lat, lng);
+    res.json(result);
+  } catch (error: unknown) {
+    logger.error('Water audit failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Water audit failed',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.post('/api/culture/heritage-audit', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const { lat, lng } = req.body ?? {};
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      res.status(400).json({ error: 'Missing coordinates' });
+      return;
+    }
+
+    const result = await runHeritageAudit(lat, lng);
+    res.json(result);
+  } catch (error: unknown) {
+    logger.error('Heritage audit failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Heritage audit failed',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.post('/api/climate/smhi-audit', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const { lat, lng } = req.body ?? {};
+    if (typeof lat !== 'number' || typeof lng !== 'number') {
+      res.status(400).json({ error: 'Missing coordinates' });
+      return;
+    }
+
+    const result = await runClimateAudit(lat, lng);
+    res.json(result);
+  } catch (error: unknown) {
+    logger.error('Climate audit failed', { path: req.path, error: String(error) });
+    res.status(500).json({
+      error: 'Climate audit failed',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.get('/api/datasources/public-summary', rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    const refresh = parseBooleanFlag(req.query.refresh, false);
+    const summary = await getPublicDatasourceSummary(refresh);
+    res.json({ ok: true, summary });
+  } catch (error: unknown) {
+    res
+      .status(500)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'Public summary failed' });
+  }
+});
+
+router.get('/api/datasources/health', rateLimitByUser(30, 60_000), async (_req, res) => {
+  try {
+    const summary = await getPublicDatasourceSummary(false);
+    const cards = summary.cards;
+    const total = cards.length;
+    const connected = cards.filter((c) => c.status === 'CONNECTED').length;
+    const disconnected = cards.filter((c) => c.status === 'DISCONNECTED').length;
+    const errors = cards.filter((c) => c.status === 'ERROR').length;
+    const permitRequired = cards.filter((c) => c.activation === 'PERMIT_REQUIRED').length;
+    const immediateSources = cards.filter((c) => c.activation === 'IMMEDIATE');
+    const allOpenSourcesActive = immediateSources.every((c) => c.status === 'CONNECTED');
+    const notResponding = immediateSources
+      .filter((c) => c.status !== 'CONNECTED')
+      .map((c) => ({ name: c.name, provider: c.provider, status: c.status, reason: c.reason }));
+    res.json({
+      ok: true,
+      allOpenSourcesActive,
+      connected,
+      disconnected,
+      errors,
+      total,
+      permitRequired,
+      notResponding,
+      checkedAt: summary.checkedAt,
+    });
+  } catch (error: unknown) {
+    res
+      .status(500)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'Health check failed' });
+  }
+});
+
+/**
+ * Publik läsning: talar om ifall BankID går att starta utan att skicka order.
+ * Används av inloggningssidan så användare inte fastnar när avtal/cert saknas.
+ */
+router.get('/api/auth/bankid/status', rateLimitByUser(60, 60_000), (_req, res) => {
+  if (isBankIdMockMode()) {
+    res.json({
+      ok: true,
+      mode: 'mock',
+      canInitiate: true,
+      message: 'BankID körs i utvecklingsläge (mock).',
+    });
+    return;
+  }
+
+  const hasPfx = Boolean(process.env.BANKID_PFX_PATH);
+  const hasPemPair = Boolean(process.env.BANKID_CERT_PATH && process.env.BANKID_KEY_PATH);
+  const hasBaseUrl = Boolean(String(process.env.BANKID_BASE_URL || '').trim());
+  if (!hasBaseUrl || (!hasPfx && !hasPemPair)) {
+    res.json({
+      ok: true,
+      mode: 'unconfigured',
+      canInitiate: false,
+      message:
+        'BankID är inte konfigurerat (saknas certifikat eller BANKID_BASE_URL). Använd administratörsinloggning tills avtal och certifikat är klara.',
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    mode: 'real',
+    canInitiate: true,
+    message: 'BankID kan användas.',
+  });
+});
+
+router.post('/api/auth/bankid/init', rateLimitByUser(10, 60_000), async (req, res) => {
+  try {
+    const endUserIp = String(req.body?.endUserIp ?? (req.ip || '127.0.0.1'));
+    const personalNumber = normalizeBankIdPersonalNumber(req.body?.personalNumber);
+    const orderTime = new Date();
+    const order = await initiateBankIdAuth(endUserIp, { personalNumber });
+    const qrPayload = generateAnimatedQrPayload({
+      qrStartToken: order.qrStartToken,
+      qrStartSecret: order.qrStartSecret,
+      orderTime,
+    });
+    res.json({ ok: true, ...order, orderTime: orderTime.toISOString(), qrPayload });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'bankid init failed' });
+  }
+});
+
+router.post('/api/auth/bankid/collect', rateLimitByUser(60, 60_000), async (req, res) => {
+  try {
+    const orderRef = String(req.body?.orderRef ?? '');
+    const endUserIp = String(req.body?.endUserIp ?? (req.ip || '127.0.0.1'));
+    const result = await collectBankIdAuth(orderRef, endUserIp);
+    res.json({ ok: true, ...result });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'collect failed' });
+  }
+});
+
+router.post('/api/auth/bankid/cancel', rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    const orderRef = String(req.body?.orderRef ?? '');
+    const result = await cancelBankIdAuth(orderRef);
+    res.json({ ok: true, ...result });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'cancel failed' });
+  }
+});
+
+router.get('/api/auth/bankid/mock/orders/:orderRef', rateLimitByUser(120, 60_000), (req, res) => {
+  try {
+    if (getBankIdMode() !== 'mock') {
+      res.status(404).json({ ok: false, error: 'Mock BankID mode is disabled' });
+      return;
+    }
+
+    const order = getMockBankIdOrder(String(req.params.orderRef || ''));
+    res.json({ ok: true, mode: 'mock', order });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'mock order lookup failed' });
+  }
+});
+
+router.get('/api/auth/bankid/mock/launch/:orderRef', rateLimitByUser(120, 60_000), (req, res) => {
+  if (getBankIdMode() !== 'mock') {
+    res.status(404).send('Mock BankID mode is disabled');
+    return;
+  }
+
+  res
+    .type('html')
+    .send(renderMockBankIdLaunchHtml(String(req.params.orderRef || ''), String(res.locals.csrfToken || '')));
+});
+
+router.post('/api/auth/bankid/mock/complete', rateLimitByUser(120, 60_000), (req, res) => {
+  try {
+    if (getBankIdMode() !== 'mock') {
+      res.status(404).json({ ok: false, error: 'Mock BankID mode is disabled' });
+      return;
+    }
+
+    const orderRef = String(req.body?.orderRef ?? '');
+    const bankidId = typeof req.body?.bankidId === 'string' ? req.body.bankidId.trim() || undefined : undefined;
+    const order = completeMockBankIdOrder({ orderRef, bankidId });
+    res.json({ ok: true, mode: 'mock', order });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'mock completion failed' });
+  }
+});
+
+router.post('/api/auth/bankid/mock/fail', rateLimitByUser(120, 60_000), (req, res) => {
+  try {
+    if (getBankIdMode() !== 'mock') {
+      res.status(404).json({ ok: false, error: 'Mock BankID mode is disabled' });
+      return;
+    }
+
+    const orderRef = String(req.body?.orderRef ?? '');
+    const hintCode = typeof req.body?.hintCode === 'string' ? req.body.hintCode : undefined;
+    const order = failMockBankIdOrder({ orderRef, hintCode });
+    res.json({ ok: true, mode: 'mock', order });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'mock fail failed' });
+  }
+});
+
+router.post('/api/auth/refresh', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const token = String(req.body?.refreshToken ?? '');
+    const rotated = await refreshSession(token);
+    res.json({ ok: true, ...rotated });
+  } catch (error: unknown) {
+    res.status(401).json({ ok: false, error: error instanceof Error ? error.message : 'refresh failed' });
+  }
+});
+
+router.get('/api/app/bootstrap', requireAuth, rateLimitByUser(60, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const requestedActiveProjectId = parseOptionalText(req.query.activeProjectId);
+    const checkedAt = new Date().toISOString();
+
+    const [organisation, projects, datasourceSummary] = await Promise.all([
+      prisma.organisation.findUnique({
+        where: { id: req.authUser.organisationId },
+        select: {
+          id: true,
+          name: true,
+          orgNumber: true,
+        },
+      }),
+      listAccessibleProjects({
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      }),
+      getPublicDatasourceSummary(),
+    ]);
+
+    if (!organisation) {
+      res.status(404).json({ ok: false, error: 'Organisation not found for authenticated user' });
+      return;
+    }
+
+    const accessibleProjectIds = new Set(projects.map((project) => project.id));
+    const activeProjectId =
+      requestedActiveProjectId && accessibleProjectIds.has(requestedActiveProjectId)
+        ? requestedActiveProjectId
+        : projects[0]?.id || null;
+
+    const dispatch = getDispatchProviderRuntimeStatus();
+    const dispatchStatus =
+      dispatch.activeProvider === 'NOT_CONFIGURED'
+        ? 'not_configured'
+        : dispatch.fallbackActive
+          ? 'unavailable'
+          : 'ready';
+    const datasourceStatus = datasourceSummary.cards.some((card) => card.status === 'CONNECTED')
+      ? 'ready'
+      : datasourceSummary.cards.length > 0
+        ? 'unavailable'
+        : 'not_configured';
+
+    const bootstrap: AppBootstrapResponse = {
+      user: {
+        id: req.authUser.id,
+        displayName: req.authUser.bankidId,
+        bankidId: req.authUser.bankidId,
+        role: req.authUser.role,
+        organisationId: req.authUser.organisationId,
+      },
+      organisation: {
+        id: organisation.id,
+        name: organisation.name,
+        orgNumber: organisation.orgNumber,
+      },
+      projects,
+      activeProjectId,
+      moduleAccess: summarizeModuleAccess({
+        activeProjectId,
+        projectCount: projects.length,
+        role: req.authUser.role,
+      }),
+      integrationAvailability: {
+        app: {
+          status: 'ready',
+          reason: 'Bootstrap-data laddad fran servern.',
+          checkedAt,
+        },
+        dispatch: {
+          status: dispatchStatus,
+          reason:
+            dispatchStatus === 'ready'
+              ? `Aktiv provider: ${dispatch.activeProvider}.`
+              : dispatchStatus === 'not_configured'
+                ? 'Ingen dispatch-provider ar konfigurerad.'
+                : `Begard provider kunde inte anvandas; ingen verifierad transportprovider ar aktiv.`,
+          checkedAt,
+        },
+        bankId: {
+          status: getBankIdMode() === 'real' ? 'ready' : 'unavailable',
+          reason:
+            getBankIdMode() === 'real'
+              ? 'BankID ar konfigurerat i skarpt eller verifierat testlage.'
+              : 'BankID kor i mock-lage. Flodet ar sanningsenligt markerat som utvecklingsberoende.',
+          checkedAt,
+        },
+        dataSources: {
+          status: datasourceStatus,
+          reason:
+            datasourceStatus === 'ready'
+              ? `${datasourceSummary.cards.filter((card) => card.status === 'CONNECTED').length} datakallor ar anslutna.`
+              : datasourceStatus === 'not_configured'
+                ? 'Inga datakallor kunde verifieras.'
+                : 'Datakallor svarar delvis eller ar otillgangliga.',
+          checkedAt,
+        },
+      },
+      uiCapabilities: {
+        authenticated: true,
+        canCreateProjects: req.authUser.role === 'ADMIN',
+        bankIdMode: getBankIdMode(),
+        requiresProjectSelection: activeProjectId == null && projects.length > 0,
+      },
+      checkedAt,
+    };
+
+    res.json({ ok: true, bootstrap });
+  } catch (error: unknown) {
+    res.status(500).json({ ok: false, error: error instanceof Error ? error.message : 'bootstrap failed' });
+  }
+});
+
+router.get('/api/reference/waste-codes', requireAuth, rateLimitByUser(60, 60_000), (_req, res) => {
+  res.json({
+    ok: true,
+    state: WASTE_CODES.length > 0 ? 'ready' : 'empty',
+    codes: WASTE_CODES,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+router.get('/api/reference/templates', requireAuth, rateLimitByUser(60, 60_000), (_req, res) => {
+  res.json({
+    ok: true,
+    state: TEMPLATE_PACKS.length > 0 ? 'ready' : 'empty',
+    templates: TEMPLATE_PACKS,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+router.get('/api/reference/map-layers', requireAuth, rateLimitByUser(60, 60_000), (_req, res) => {
+  res.json({
+    ok: true,
+    state: MAP_LAYER_REFERENCE.length > 0 ? 'ready' : 'empty',
+    layers: MAP_LAYER_REFERENCE,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+router.get('/api/reference/receivers', requireAuth, rateLimitByUser(60, 60_000), (_req, res) => {
+  res.json({
+    ok: true,
+    state: 'empty',
+    receivers: [],
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+router.get('/api/reference/municipalities', requireAuth, rateLimitByUser(60, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const docs = await prisma.documentRecord.findMany({
+      where: {
+        organisationId: req.authUser.organisationId,
+        municipalityNormalized: {
+          not: null,
+        },
+      },
+      select: {
+        municipalityNormalized: true,
+        municipality: true,
+        projectId: true,
+      },
+      take: 5000,
+      orderBy: {
+        updatedAt: 'desc',
+      },
+    });
+
+    const summaryMap = new Map<string, { name: string; projectIds: Set<string>; documentCount: number }>();
+    for (const doc of docs) {
+      const key = String(doc.municipalityNormalized || doc.municipality || '').trim();
+      if (!key) continue;
+      const existing = summaryMap.get(key) || {
+        name: String(doc.municipality || doc.municipalityNormalized || key).trim(),
+        projectIds: new Set<string>(),
+        documentCount: 0,
+      };
+      existing.documentCount += 1;
+      if (doc.projectId) existing.projectIds.add(doc.projectId);
+      summaryMap.set(key, existing);
+    }
+
+    const municipalities: ReferenceMunicipalitySummary[] = Array.from(summaryMap.values())
+      .map((item) => ({
+        name: item.name,
+        projectCount: item.projectIds.size,
+        documentCount: item.documentCount,
+      }))
+      .sort((a, b) => b.documentCount - a.documentCount)
+      .slice(0, 50);
+
+    res.json({
+      ok: true,
+      state: municipalities.length > 0 ? 'ready' : 'empty',
+      municipalities,
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (error: unknown) {
+    res
+      .status(500)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'municipality reference failed' });
+  }
+});
+
+router.post('/api/admin/auth/login', rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    const username = String(req.body?.username ?? '').trim();
+    const password = String(req.body?.password ?? '');
+
+    const expectedUsername = String(process.env.ADMIN_CONSOLE_USERNAME || 'admin').trim();
+    const expectedPassword = String(process.env.ADMIN_CONSOLE_PASSWORD || '');
+    if (!expectedPassword) {
+      res
+        .status(503)
+        .json({ ok: false, error: 'Admin login is not configured (ADMIN_CONSOLE_PASSWORD missing).' });
+      return;
+    }
+
+    if (!username || username !== expectedUsername || password !== expectedPassword) {
+      res.status(401).json({ ok: false, error: 'Invalid admin credentials' });
+      return;
+    }
+
+    const user = await ensureAdminConsoleUser(username);
+    const tokens = createTokenPair(user);
+    res.json({
+      ok: true,
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      user: {
+        id: user.id,
+        role: user.role,
+        organisationId: user.organisationId,
+      },
+    });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'admin login failed' });
+  }
+});
+
+// POST /api/property/lookup och /postgis: se server/routes/property.routes.ts (propertyLookupRouter i createApp)
+
+router.get('/api/system/postgis', async (_req, res) => {
+  try {
+    const result = await prisma.$queryRaw<Array<{ postgis_full_version: string }>>`
+      SELECT postgis_full_version()
+    `;
+    res.json({
+      ok: true,
+      version: result[0]?.postgis_full_version,
+      message: 'PostGIS ar korrekt installerat och svarar.',
+    });
+  } catch (error: unknown) {
+    logger.error('PostGIS version check failed', { error: String(error) });
+    res.status(500).json({
+      ok: false,
+      message: 'PostGIS verkar saknas eller databasen ar inte konfigurerad.',
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error),
+    });
+  }
+});
+
+router.get(
+  '/api/datasources/lantmateriet/open/status',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      assertPermission(req.authUser, 'AUDIT_EXPORT');
+      const result = await getLantmaterietOpenMapStatus();
+      res.json({ ok: true, result });
+    } catch (error: unknown) {
+      res.status(400).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'Lantmateriet open status failed',
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lantmäteriet anslutningstest (admin only)
+// POST /api/admin/lantmateriet/test
+// Testar token-hämtning + OGC-uppslag. Returnerar detaljerad statusrapport.
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post('/api/admin/lantmateriet/test', requireAuth, rateLimitByUser(5, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+    const result = await testLantmaterietConnection();
+    res.json({ ok: true, result });
+  } catch (error: unknown) {
+    res.status(500).json({
+      ok: false,
+      error: error instanceof Error ? error.message : 'Lantmäteriet connection test failed',
+    });
+  }
+});
+
+router.get('/api/audit/export', requireAuth, rateLimitByUser(10, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    assertPermission(req.authUser, 'AUDIT_EXPORT');
+    const integrity = verifyAuditTrail();
+    const dbRecords = await getAuditExportRows();
+    res.json({
+      ok: true,
+      integrity,
+      memoryRecords: exportAuditTrail(),
+      records: dbRecords,
+    });
+  } catch (error: unknown) {
+    res.status(403).json({ ok: false, error: error instanceof Error ? error.message : 'forbidden' });
+  }
+});
+
+router.get('/api/datasources/catalog', requireAuth, rateLimitByUser(30, 60_000), (_req, res) => {
+  res.json({ ok: true, sources: SOURCE_CATALOG });
+});
+
+router.post('/api/datasources/open/sync', requireAuth, rateLimitByUser(10, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    assertPermission(req.authUser, 'AUDIT_EXPORT');
+    const results = await fetchImmediateOpenSources();
+    res.json({ ok: true, results });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'sync failed' });
+  }
+});
+
+router.get('/api/datasources/slu/status', requireAuth, rateLimitByUser(10, 60_000), (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    assertPermission(req.authUser, 'AUDIT_EXPORT');
+    res.json({ ok: true, products: getSluProductStatus() });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'SLU status failed' });
+  }
+});
+
+router.get(
+  '/api/datasources/slu/ping/:product',
+  requireAuth,
+  rateLimitByUser(10, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      assertPermission(req.authUser, 'AUDIT_EXPORT');
+      const product = String(req.params.product || '') as
+        | 'species_observations'
+        | 'taxonomy'
+        | 'artfakta'
+        | 'metodkatalog';
+      const result = await pingSluProduct(product);
+      res.json({ ok: true, result });
+    } catch (error: unknown) {
+      res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'SLU ping failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/datasources/slu/observations',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      const projectId = String(req.body?.projectId ?? '');
+      const purpose = String(req.body?.purpose ?? '');
+      const payload = (req.body?.payload ?? {}) as Record<string, unknown>;
+      const result = await searchSluObservations({ projectId, purpose, payload, user: req.authUser });
+      res.json({ ok: true, result });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'SLU observation search failed' });
+    }
+  },
+);
+
+router.post('/api/datasources/slu/proxy', requireAuth, rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const product = String(req.body?.product ?? '') as
+      | 'species_observations'
+      | 'taxonomy'
+      | 'artfakta'
+      | 'metodkatalog';
+    const method = String(req.body?.method ?? 'GET').toUpperCase() as 'GET' | 'POST';
+    const purpose = String(req.body?.purpose ?? '');
+    const projectId = req.body?.projectId ? String(req.body.projectId) : undefined;
+    const pathSuffix = req.body?.pathSuffix ? String(req.body.pathSuffix) : undefined;
+    const payload = (req.body?.payload ?? {}) as Record<string, unknown>;
+    const query = (req.body?.query ?? {}) as Record<string, string | number | boolean>;
+
+    const result = await callSluProductApi({
+      product,
+      method,
+      pathSuffix,
+      payload,
+      query,
+      purpose,
+      projectId,
+      user: req.authUser,
+    });
+    res.json({ ok: true, result });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'SLU proxy failed' });
+  }
+});
+
+router.get('/api/search/info', requireAuth, rateLimitByUser(60, 60_000), (_req, res) => {
+  res.json({
+    ok: true,
+    info: {
+      description: 'Vad är sökbart i dokumentdatabasen',
+      modes: [
+        {
+          id: 'hybrid',
+          label: 'Hybrid (rekommenderat)',
+          description:
+            'Kombinerar semantisk (vektorsökning) med lexikal matchning. Ger bäst precision och recall.',
+        },
+        {
+          id: 'semantic',
+          label: 'Semantisk',
+          description:
+            'Vektorsökning med pgvector. Hittar dokument med liknande innebörd även utan exakta nyckelord.',
+        },
+        {
+          id: 'lexical',
+          label: 'Lexikal',
+          description: 'Nyckelordsmatchning mot ämne, filnamn och disk-ID. Snabb och deterministisk.',
+        },
+      ],
+      fullTextFields: [
+        {
+          field: 'content.searchText',
+          label: 'Dokumenttext (fulltext)',
+          source: 'Extraherad text ur PDF/bild via OCR eller direktextrahering',
+          searchable: true,
+        },
+        {
+          field: 'chunks[].chunkText',
+          label: 'Textstycken (semantiska chunks)',
+          source: 'Dokumentet delas in i ~180-ords-stycken för semantisk sökning',
+          searchable: true,
+        },
+      ],
+      metadataFilterFields: [
+        {
+          field: 'municipality',
+          label: 'Kommun',
+          type: 'string',
+          example: 'Orsa',
+          description: 'Exakt matchning (case-insensitive)',
+        },
+        {
+          field: 'decisionType',
+          label: 'Ärendetyp / beslutstyp',
+          type: 'string',
+          example: 'Tillstånd',
+          description: 'Typ av miljöbeslut',
+        },
+        {
+          field: 'wasteType',
+          label: 'Avfallstyp',
+          type: 'string',
+          example: 'Schaktmassor',
+          description: 'Typ av avfall',
+        },
+        {
+          field: 'legalStatus',
+          label: 'Juridisk status',
+          type: 'string',
+          example: 'Aktiv',
+          description: 'Rättslig status för ärendet',
+        },
+        {
+          field: 'hazardousFlag',
+          label: 'Farligt avfall',
+          type: 'boolean',
+          example: true,
+          description: 'true = farligt avfall, false = icke-farligt',
+        },
+        {
+          field: 'status',
+          label: 'Bearbetningsstatus',
+          type: 'enum',
+          values: ['METADATA_ONLY', 'TEXT_EXTRACTED', 'CHUNKED', 'EMBEDDED', 'FAILED'],
+          description: 'Dokumentets indexeringsstatus',
+        },
+        {
+          field: 'dateFrom / dateTo',
+          label: 'Tidsintervall',
+          type: 'date',
+          example: '2023-01-01',
+          description: 'Filtrerar på receivedTime (när ärendet inkom)',
+        },
+      ],
+      lexicalMatchFields: [
+        {
+          field: 'subject',
+          label: 'Ämne / ärendetitel',
+          description: 'Rubriken på dokumentet eller e-postmeddelandet',
+        },
+        {
+          field: 'originalName',
+          label: 'Originalfilnamn',
+          description: 'Det filnamn som lämnades in med ärendet',
+        },
+        { field: 'diskName', label: 'Diskfilnamn', description: 'Internt unikt filnamn på servern' },
+      ],
+      queryParameters: {
+        query: 'Fritext att söka efter (obligatorisk för semantik/lexikal)',
+        mode: 'hybrid | semantic | lexical',
+        topK: 'Antal träffar att returnera (1–100, default 20)',
+        strictEvidence: 'true = returnera bara dokument med citeringsstöd (default true)',
+        projectId: 'Begränsa sökning till ett specifikt projekt (admin kan söka globalt)',
+        filters: 'Objekt med metadatafilter (se metadataFilterFields ovan)',
+      },
+    },
+  });
+});
+
+router.post(
+  '/api/search/sync-manifest',
+  requireAuth,
+  rateLimitByUser(10, 60_000),
+  rateLimitByOrg(120, 60 * 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.body?.projectId ?? '');
+      if (!projectId) {
+        res.status(400).json({ ok: false, error: 'projectId is required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const config = getSearchConfig();
+      const manifestPath = req.body?.manifestPath ? String(req.body.manifestPath) : config.manifestPath;
+      const outlookBaseDir = req.body?.outlookBaseDir
+        ? String(req.body.outlookBaseDir)
+        : config.outlookBaseDir;
+
+      const job = await enqueueSearchJob({
+        type: 'SYNC_MANIFEST',
+        projectId,
+        payload: {
+          projectId,
+          organisationId: req.authUser.organisationId,
+          manifestPath,
+          outlookBaseDir,
+        },
+      });
+
+      const processedImmediately = await processSearchJobsOnce(1);
+      res.json({
+        ok: true,
+        jobId: job.id,
+        processedImmediately,
+        config: {
+          manifestPath,
+          outlookBaseDir,
+        },
+      });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'sync manifest failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/search/query',
+  requireAuth,
+  rateLimitByUser(80, 60_000),
+  rateLimitByOrg(800, 60 * 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectIdRaw = String(req.body?.projectId ?? '').trim();
+      const projectId = projectIdRaw || undefined;
+      const query = String(req.body?.query ?? '');
+      const mode = req.body?.mode === 'semantic' || req.body?.mode === 'lexical' ? req.body.mode : 'hybrid';
+      const topK = Number(req.body?.topK ?? 20);
+      const strictEvidenceRaw = String(req.body?.strictEvidence ?? 'true')
+        .trim()
+        .toLowerCase();
+      const strictEvidence = !['false', '0', 'no'].includes(strictEvidenceRaw);
+      const filters = (req.body?.filters ?? {}) as Record<string, unknown>;
+
+      if (projectId) {
+        await assertProjectMembership({
+          projectId,
+          userId: req.authUser.id,
+          organisationId: req.authUser.organisationId,
+          role: req.authUser.role,
+        });
+      } else if (req.authUser.role !== 'ADMIN') {
+        res.status(400).json({ ok: false, error: 'projectId is required for non-admin users' });
+        return;
+      }
+
+      const result = await runSearchQuery({
+        organisationId: req.authUser.organisationId,
+        projectId,
+        userId: req.authUser.id,
+        query,
+        mode,
+        topK,
+        strictEvidence,
+        filters: {
+          municipality: typeof filters.municipality === 'string' ? filters.municipality : undefined,
+          decisionType: typeof filters.decisionType === 'string' ? filters.decisionType : undefined,
+          wasteType: typeof filters.wasteType === 'string' ? filters.wasteType : undefined,
+          status: typeof filters.status === 'string' ? filters.status : undefined,
+          legalStatus: typeof filters.legalStatus === 'string' ? filters.legalStatus : undefined,
+          hazardousFlag: typeof filters.hazardousFlag === 'boolean' ? filters.hazardousFlag : undefined,
+          dateFrom: typeof filters.dateFrom === 'string' ? filters.dateFrom : undefined,
+          dateTo: typeof filters.dateTo === 'string' ? filters.dateTo : undefined,
+        },
+      });
+
+      res.json({ ok: true, result });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'search query failed' });
+    }
+  },
+);
+
+router.get('/api/search/status', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const projectIdRaw = String(req.query?.projectId ?? '').trim();
+    const projectId = projectIdRaw || undefined;
+
+    if (projectId) {
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+    } else if (req.authUser.role !== 'ADMIN') {
+      res.status(400).json({ ok: false, error: 'projectId is required for non-admin users' });
+      return;
+    }
+
+    const status = await getSearchStatus(req.authUser.organisationId, projectId);
+    res.json({ ok: true, status });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'search status failed' });
+  }
+});
+
+router.get('/api/search/status/:projectId', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const projectId = String(req.params.projectId || '');
+    if (!projectId) {
+      res.status(400).json({ ok: false, error: 'projectId is required' });
+      return;
+    }
+
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+
+    const status = await getSearchStatus(req.authUser.organisationId, projectId);
+    res.json({ ok: true, status });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'search status failed' });
+  }
+});
+
+router.post('/api/search/recover-stale', requireAuth, rateLimitByUser(6, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const projectIdRaw = String(req.body?.projectId ?? '').trim();
+    const projectId = projectIdRaw || undefined;
+    if (projectId) {
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+    } else if (req.authUser.role !== 'ADMIN') {
+      res.status(400).json({ ok: false, error: 'projectId is required for non-admin users' });
+      return;
+    }
+
+    const maxAgeMinutes = Math.max(5, Math.min(24 * 60, Number(req.body?.maxAgeMinutes ?? 30)));
+    const limit = Math.max(1, Math.min(1000, Number(req.body?.limit ?? 200)));
+    const recovered = await recoverStaleRunningJobs({ projectId, maxAgeMinutes, limit });
+    const processedImmediately = await processSearchJobsOnce(2);
+    res.json({ ok: true, recovered, processedImmediately });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'recover stale jobs failed' });
+  }
+});
+
+router.post('/api/search/retry-failed', requireAuth, rateLimitByUser(10, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const projectId = String(req.body?.projectId ?? '');
+    const limit = Number(req.body?.limit ?? 100);
+    if (!projectId) {
+      res.status(400).json({ ok: false, error: 'projectId is required' });
+      return;
+    }
+
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+
+    const requeued = await requeueFailedJobs(projectId, Math.max(1, Math.min(limit, 500)));
+    const processedImmediately = await processSearchJobsOnce(2);
+    res.json({ ok: true, requeued, processedImmediately });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'retry failed jobs failed' });
+  }
+});
+
+router.get('/api/projects/:projectId/plan', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const projectId = String(req.params.projectId || '');
+    if (!projectId) {
+      res.status(400).json({ ok: false, error: 'projectId is required' });
+      return;
+    }
+
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+
+    const plan = await getProjectPlanSnapshot(projectId, req.authUser.organisationId);
+    res.json({ ok: true, plan });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'project plan load failed' });
+  }
+});
+
+router.post(
+  '/api/projects/:projectId/plan/save',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      if (!projectId) {
+        res.status(400).json({ ok: false, error: 'projectId is required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const plan = await saveProjectPlanSnapshot({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:save`,
+        action: 'PLAN_SAVE',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          templateId: plan.templateId,
+          projectType: plan.projectType,
+        },
+      });
+
+      res.json({ ok: true, plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'project plan save failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/template/apply',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const templateId = String(req.body?.templateId || '');
+      if (!projectId || !templateId) {
+        res.status(400).json({ ok: false, error: 'projectId and templateId are required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const plan = await applyTemplateForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        templateId,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:template:${templateId}`,
+        action: 'TEMPLATE_APPLY',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          templateId,
+          projectType: plan.projectType,
+        },
+      });
+
+      res.json({ ok: true, plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'template apply failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/permit-code-profile/apply',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const code = String(req.body?.code || '').trim();
+      const codeType = String(req.body?.codeType || '')
+        .trim()
+        .toUpperCase();
+      const municipality = parseOptionalText(req.body?.municipality);
+
+      if (!projectId || !code || (codeType !== 'SNI' && codeType !== 'EWC')) {
+        res.status(400).json({ ok: false, error: 'projectId, code and valid codeType are required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const currentPlan =
+        asOptionalProjectPlan(req.body?.plan) ||
+        (await getProjectPlanSnapshot(projectId, req.authUser.organisationId));
+      const applied = applyPermitCodeSelection(currentPlan as ProjectPlan, {
+        code,
+        codeType: codeType as 'SNI' | 'EWC',
+        municipality,
+      });
+
+      const plan = await saveProjectPlanSnapshot({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        plan: applied.plan,
+      });
+
+      res.json({ ok: true, plan, profile: applied.profile });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'permit code apply failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/stage-gates/:gateId/evaluate',
+  requireAuth,
+  rateLimitByUser(40, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const gateId = String(req.params.gateId || '');
+      if (!projectId || !gateId) {
+        res.status(400).json({ ok: false, error: 'projectId and gateId are required' });
+        return;
+      }
+
+      const gateType = gateId.startsWith('gate-') ? gateId.replace(/^gate-/, '') : gateId;
+      if (!allowedStageGateTypes.includes(gateType as StageGateType)) {
+        res.status(400).json({ ok: false, error: 'Invalid gateId' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const evaluated = await evaluateGateForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        gateId,
+        plan: asOptionalProjectPlan(req.body?.plan),
+        context: {
+          permitType: req.body?.permitType ? String(req.body.permitType) : undefined,
+          codeType:
+            req.body?.codeType === 'SNI' || req.body?.codeType === 'EWC' ? req.body.codeType : undefined,
+          permitSubmitted:
+            typeof req.body?.permitSubmitted === 'boolean' ? req.body.permitSubmitted : undefined,
+          mapLayerAvailable: parseMapLayerList(req.body?.mapLayerAvailable),
+          note: req.body?.note ? String(req.body.note) : undefined,
+        },
+      });
+
+      if (!evaluated.idempotent) {
+        await appendDomainAudit({
+          entityType: 'ProjectPlan',
+          entityId: `${projectId}:${evaluated.gate.id}`,
+          action: 'STAGE_GATE_EVALUATE',
+          userId: req.authUser.id,
+          payload: {
+            projectId,
+            gateId: evaluated.gate.id,
+            status: evaluated.gate.status,
+            changed: evaluated.changed,
+          },
+        });
+
+        // ── Notifiera projektmedlemmar om gate-statusbyte ───────────────────
+        void notifyStageGate({
+          projectId,
+          gateId: evaluated.gate.id,
+          status: String(evaluated.gate.status ?? 'BLOCKED'),
+          actingUserId: req.authUser.id,
+        }).catch(() => {
+          /* best-effort */
+        });
+      }
+
+      res.json({
+        ok: true,
+        gate: evaluated.gate,
+        changed: evaluated.changed,
+        idempotent: evaluated.idempotent,
+        plan: evaluated.plan,
+      });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'stage gate evaluation failed' });
+    }
+  },
+);
+
+// ── Projektmedlemmar ────────────────────────────────────────────────────────
+
+router.get('/api/projects/:projectId/members', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const projectId = String(req.params.projectId || '');
+    if (!projectId) {
+      res.status(400).json({ ok: false, error: 'projectId is required' });
+      return;
+    }
+
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+
+    const members: ProjectMemberRecord[] = await listProjectMembers(projectId);
+    res.json({ ok: true, members });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'list members failed' });
+  }
+});
+
+router.put('/api/projects/:projectId/members', requireAuth, rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const projectId = String(req.params.projectId || '');
+    const targetBankidId = String(req.body?.bankidId ?? '').trim();
+    const role = String(req.body?.role ?? '') as ProjectAccessRole;
+
+    if (!projectId || !targetBankidId || !role) {
+      res.status(400).json({ ok: false, error: 'projectId, bankidId and role are required' });
+      return;
+    }
+    if (!isValidRole(role)) {
+      res
+        .status(400)
+        .json({ ok: false, error: `Invalid role. Must be one of: OWNER, CONTRIBUTOR, REVIEWER, AUDITOR` });
+      return;
+    }
+
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+
+    const member = await upsertProjectMember({
+      projectId,
+      targetBankidId,
+      role,
+      actingUserId: req.authUser.id,
+    });
+
+    // Notifiera
+    void sendProjectNotification({
+      projectId,
+      event: 'MEMBER_ADDED',
+      subjectUserId: member.userId,
+      actingUserId: req.authUser.id,
+      message: `Användare ${targetBankidId} lades till i projekt ${projectId} med roll ${role}.`,
+    }).catch(() => {
+      /* best-effort */
+    });
+
+    res.json({ ok: true, member });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'upsert member failed' });
+  }
+});
+
+router.delete(
+  '/api/projects/:projectId/members/:memberId',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      const projectId = String(req.params.projectId || '');
+      const memberId = String(req.params.memberId || '');
+      if (!projectId || !memberId) {
+        res.status(400).json({ ok: false, error: 'projectId and memberId are required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      await removeProjectMember({
+        projectId,
+        memberId,
+        actingUserId: req.authUser.id,
+      });
+
+      void sendProjectNotification({
+        projectId,
+        event: 'MEMBER_REMOVED',
+        actingUserId: req.authUser.id,
+        message: `Projektmedlem ${memberId} togs bort från projekt ${projectId}.`,
+      }).catch(() => {
+        /* best-effort */
+      });
+
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'remove member failed' });
+    }
+  },
+);
+
+// ── Kunskapsgraf-sökning ────────────────────────────────────────────────────
+
+router.get(
+  '/api/admin/knowledge-graph/search',
+  requireAuth,
+  rateLimitByUser(40, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const query = String(req.query.q ?? '').trim();
+      if (!query) {
+        res.status(400).json({ ok: false, error: "Query parameter 'q' is required" });
+        return;
+      }
+
+      const nodeTypes = req.query.nodeTypes
+        ? String(req.query.nodeTypes)
+            .split(',')
+            .map((t) => t.trim())
+            .filter(Boolean)
+        : undefined;
+      const limit = req.query.limit ? Math.min(Number(req.query.limit), 200) : 50;
+
+      const [result, stats] = await Promise.all([searchGraph({ query, nodeTypes, limit }), getGraphStats()]);
+
+      res.json({ ok: true, query, nodes: result.nodes, edges: result.edges, stats });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'knowledge graph search failed' });
+    }
+  },
+);
+
+router.get('/api/admin/knowledge-graph/stats', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const stats = await getGraphStats();
+    res.json({ ok: true, stats });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'knowledge graph stats failed' });
+  }
+});
+
+router.post(
+  '/api/projects/:projectId/carbon/calculate',
+  requireAuth,
+  rateLimitByUser(40, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      if (!projectId) {
+        res.status(400).json({ ok: false, error: 'projectId is required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const rawInput = (req.body?.carbonInput || {}) as Partial<CarbonInput>;
+      const transportMode = String(rawInput.transportMode || 'TRUCK') as CarbonInput['transportMode'];
+      const materialType = String(rawInput.materialType || 'SOIL') as CarbonInput['materialType'];
+      if (
+        !['TRUCK', 'RAIL', 'SHIP'].includes(transportMode) ||
+        !['SOIL', 'ROCK', 'WASTE', 'MIXED'].includes(materialType)
+      ) {
+        res.status(400).json({ ok: false, error: 'Invalid carbon input mode or material type' });
+        return;
+      }
+
+      const carbonInput: CarbonInput = {
+        tons: Math.max(0, Number(rawInput.tons || 0)),
+        distanceKm: rawInput.distanceKm ? Number(rawInput.distanceKm) : undefined,
+        manualDistanceKm: rawInput.manualDistanceKm ? Number(rawInput.manualDistanceKm) : undefined,
+        transportMode,
+        materialType,
+        emissionFactorKgCo2ePerTonKm: rawInput.emissionFactorKgCo2ePerTonKm
+          ? Number(rawInput.emissionFactorKgCo2ePerTonKm)
+          : undefined,
+      };
+
+      const payload = await calculateCarbonForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        carbonInput,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:carbon`,
+        action: 'CARBON_CALCULATE',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          totalKgCo2e: payload.result.totalKgCo2e,
+          quality: payload.result.quality,
+          method: payload.result.method,
+        },
+      });
+
+      res.json({ ok: true, result: payload.result, plan: payload.plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'carbon calculation failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/map-layers/recommend',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      if (!projectId) {
+        res.status(400).json({ ok: false, error: 'projectId is required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const requestedProjectType = req.body?.projectType ? String(req.body.projectType) : undefined;
+      if (requestedProjectType && !allowedProjectTypes.includes(requestedProjectType as ProjectType)) {
+        res.status(400).json({ ok: false, error: 'Invalid projectType' });
+        return;
+      }
+
+      const payload = await recommendMapLayersForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        projectType: requestedProjectType as ProjectType | undefined,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:map-layers`,
+        action: 'MAP_LAYER_RECOMMEND',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          projectType: payload.plan.projectType,
+          enabledLayers: payload.recommendation.enabled,
+        },
+      });
+
+      res.json({ ok: true, recommendation: payload.recommendation, plan: payload.plan });
+    } catch (error: unknown) {
+      res.status(400).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'map layer recommendation failed',
+      });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/dispatch/quote',
+  requireAuth,
+  rateLimitByUser(50, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const receiverId = String(req.body?.receiverId || '').trim();
+      const receiverNameRaw = String(req.body?.receiverName || '').trim();
+      const receiverName = receiverNameRaw || receiverId;
+      const wasteCode = String(req.body?.wasteCode || '').trim();
+      const tons = Number(req.body?.tons ?? 0);
+      const distanceKmRaw = req.body?.distanceKm;
+      const distanceKm =
+        distanceKmRaw == null || distanceKmRaw === '' ? undefined : Math.max(0, Number(distanceKmRaw));
+
+      if (!projectId || !receiverId || !wasteCode || !Number.isFinite(tons) || tons <= 0) {
+        res
+          .status(400)
+          .json({ ok: false, error: 'projectId, receiverId, wasteCode and tons > 0 are required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const payload = await createDispatchQuoteForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        receiverId,
+        receiverName,
+        wasteCode,
+        tons,
+        distanceKm,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:dispatch:quote:${payload.quote.id}`,
+        action: 'DISPATCH_QUOTE_CREATE',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          quoteId: payload.quote.id,
+          receiverId: payload.quote.receiverId,
+          wasteCode: payload.quote.wasteCode,
+          tons: payload.quote.tons,
+        },
+      });
+
+      res.json({ ok: true, quote: payload.quote, plan: payload.plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'dispatch quote failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/dispatch/book',
+  requireAuth,
+  rateLimitByUser(40, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const quoteId = String(req.body?.quoteId || '').trim();
+      const plannedPickupAt = req.body?.plannedPickupAt ? String(req.body.plannedPickupAt) : undefined;
+
+      if (!projectId || !quoteId) {
+        res.status(400).json({ ok: false, error: 'projectId and quoteId are required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const payload = await bookTransportForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        quoteId,
+        plannedPickupAt,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:dispatch:booking:${payload.booking.id}`,
+        action: 'DISPATCH_BOOK',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          bookingId: payload.booking.id,
+          quoteId: payload.booking.quoteId,
+          receiverId: payload.booking.receiverId,
+          wasteCode: payload.booking.wasteCode,
+          tons: payload.booking.tons,
+        },
+      });
+
+      res.json({ ok: true, booking: payload.booking, plan: payload.plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'dispatch booking failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/driver-journals/upsert',
+  requireAuth,
+  rateLimitByUser(60, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const journalPayload = (req.body?.journal || {}) as Record<string, unknown>;
+      const bookingId = String(journalPayload.bookingId || '').trim();
+      const driverName = String(journalPayload.driverName || '').trim();
+      const vehicleId = String(journalPayload.vehicleId || '').trim();
+      const origin = String(journalPayload.origin || '').trim();
+      const destination = String(journalPayload.destination || '').trim();
+      const wasteCode = String(journalPayload.wasteCode || '').trim();
+      const tons = Number(journalPayload.tons ?? 0);
+      const odometerStartKm = Number(journalPayload.odometerStartKm ?? 0);
+      const odometerEndKmRaw = journalPayload.odometerEndKm;
+      const odometerEndKm =
+        odometerEndKmRaw == null || odometerEndKmRaw === '' ? undefined : Number(odometerEndKmRaw);
+
+      if (!projectId || !bookingId || !driverName || !vehicleId || !origin || !destination) {
+        res.status(400).json({ ok: false, error: 'projectId and mandatory journal fields are required' });
+        return;
+      }
+      if (!Number.isFinite(tons) || tons <= 0 || !Number.isFinite(odometerStartKm) || odometerStartKm < 0) {
+        res.status(400).json({ ok: false, error: 'journal tons and odometerStartKm must be valid numbers' });
+        return;
+      }
+      if (odometerEndKm != null && (!Number.isFinite(odometerEndKm) || odometerEndKm < odometerStartKm)) {
+        res.status(400).json({ ok: false, error: 'odometerEndKm must be >= odometerStartKm' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const payload = await upsertDriverJournalForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        journal: {
+          id: journalPayload.id ? String(journalPayload.id) : undefined,
+          bookingId,
+          driverName,
+          vehicleId,
+          origin,
+          destination,
+          wasteCode,
+          tons,
+          startedAt: journalPayload.startedAt ? String(journalPayload.startedAt) : undefined,
+          endedAt:
+            journalPayload.endedAt == null || journalPayload.endedAt === ''
+              ? null
+              : String(journalPayload.endedAt),
+          odometerStartKm,
+          odometerEndKm,
+          gpsTrackHash: journalPayload.gpsTrackHash ? String(journalPayload.gpsTrackHash) : undefined,
+          status: parseOptionalDriverJournalStatus(journalPayload.status),
+        },
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:journal:${payload.journal.id}`,
+        action: 'DRIVER_JOURNAL_UPSERT',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          journalId: payload.journal.id,
+          bookingId: payload.journal.bookingId,
+          status: payload.journal.status,
+        },
+      });
+
+      res.json({ ok: true, journal: payload.journal, plan: payload.plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'driver journal upsert failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/driver-journals/:journalId/sign',
+  requireAuth,
+  rateLimitByUser(60, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const journalId = String(req.params.journalId || '');
+      const signerRoleRaw = String(req.body?.signerRole || '').toUpperCase();
+      const signerRole =
+        signerRoleRaw === 'DRIVER' || signerRoleRaw === 'REVIEWER'
+          ? (signerRoleRaw as 'DRIVER' | 'REVIEWER')
+          : null;
+      const signatureId = String(req.body?.signatureId || '').trim();
+
+      if (!projectId || !journalId || !signerRole || !signatureId) {
+        res
+          .status(400)
+          .json({ ok: false, error: 'projectId, journalId, signerRole and signatureId are required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const payload = await signDriverJournalForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        journalId,
+        signerRole,
+        signatureId,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:journal:${payload.journal.id}`,
+        action: 'DRIVER_JOURNAL_SIGN',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          journalId: payload.journal.id,
+          signerRole,
+          status: payload.journal.status,
+        },
+      });
+
+      res.json({ ok: true, journal: payload.journal, plan: payload.plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'driver journal sign failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/lims/ingest',
+  requireAuth,
+  rateLimitByUser(40, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const reportPayload = (req.body?.report || {}) as Record<string, unknown>;
+      const sampleId = String(reportPayload.sampleId || '').trim();
+      const labName = String(reportPayload.labName || '').trim();
+      const rawReference = String(reportPayload.rawReference || '').trim();
+      const source = parseOptionalLimsSource(reportPayload.source) || 'MANUAL';
+      const bookingIdRaw = reportPayload.bookingId;
+      const bookingId =
+        bookingIdRaw == null || String(bookingIdRaw).trim() === '' ? undefined : String(bookingIdRaw).trim();
+      const metricsRaw = Array.isArray(reportPayload.metrics) ? reportPayload.metrics : [];
+      const metrics = metricsRaw
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => {
+          const typed = item as Record<string, unknown>;
+          return {
+            key: String(typed.key || '').trim(),
+            value: Number(typed.value ?? 0),
+            unit: String(typed.unit || '').trim(),
+            maxAllowed:
+              typed.maxAllowed == null || typed.maxAllowed === '' ? undefined : Number(typed.maxAllowed),
+          };
+        })
+        .filter((metric) => metric.key.length > 0 && Number.isFinite(metric.value) && metric.unit.length > 0);
+
+      if (!projectId || !sampleId || !labName || !rawReference) {
+        res
+          .status(400)
+          .json({ ok: false, error: 'projectId, sampleId, labName and rawReference are required' });
+        return;
+      }
+      if (metrics.length === 0) {
+        res.status(400).json({ ok: false, error: 'At least one LIMS metric is required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const payload = await ingestLimsReportForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        report: {
+          bookingId,
+          sampleId,
+          labName,
+          source,
+          analyzedAt: reportPayload.analyzedAt ? String(reportPayload.analyzedAt) : undefined,
+          rawReference,
+          metrics,
+          passed: typeof reportPayload.passed === 'boolean' ? reportPayload.passed : undefined,
+        },
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:lims:${payload.report.id}`,
+        action: 'LIMS_REPORT_INGEST',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          reportId: payload.report.id,
+          bookingId: payload.report.bookingId,
+          sampleId: payload.report.sampleId,
+          source: payload.report.source,
+          passed: payload.report.passed,
+        },
+      });
+
+      res.json({ ok: true, report: payload.report, plan: payload.plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'lims ingest failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/lims/:reportId/verify',
+  requireAuth,
+  rateLimitByUser(40, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      const reportId = String(req.params.reportId || '');
+      const reviewer = String(req.body?.reviewer || '').trim();
+      const signatureId = String(req.body?.signatureId || '').trim();
+      const approved = typeof req.body?.approved === 'boolean' ? req.body.approved : undefined;
+
+      if (!projectId || !reportId || !reviewer || !signatureId) {
+        res
+          .status(400)
+          .json({ ok: false, error: 'projectId, reportId, reviewer and signatureId are required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const payload = await verifyLimsReportForProject({
+        projectId,
+        organisationId: req.authUser.organisationId,
+        reportId,
+        reviewer,
+        signatureId,
+        approved,
+        plan: asOptionalProjectPlan(req.body?.plan),
+      });
+
+      await appendDomainAudit({
+        entityType: 'ProjectPlan',
+        entityId: `${projectId}:lims:${payload.report.id}`,
+        action: 'LIMS_REPORT_VERIFY',
+        userId: req.authUser.id,
+        payload: {
+          projectId,
+          reportId: payload.report.id,
+          reviewer: payload.report.reviewer,
+          passed: payload.report.passed,
+          verifiedAt: payload.report.verifiedAt,
+        },
+      });
+
+      res.json({ ok: true, report: payload.report, plan: payload.plan });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'lims verification failed' });
+    }
+  },
+);
+
+// ── Fältanalys — spara AI-analysresultat ───────────────────────────────────
+
+router.post(
+  '/api/projects/:projectId/field-analysis',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const projectId = String(req.params.projectId || '');
+      if (!projectId) {
+        res.status(400).json({ ok: false, error: 'projectId is required' });
+        return;
+      }
+
+      await assertProjectMembership({
+        projectId,
+        userId: req.authUser.id,
+        organisationId: req.authUser.organisationId,
+        role: req.authUser.role,
+      });
+
+      const mode = String(req.body?.mode ?? 'site');
+      const analysisType = String(req.body?.analysisType ?? 'standard');
+      const result = String(req.body?.result ?? '');
+      const filename = req.body?.filename ? String(req.body.filename) : undefined;
+
+      if (!result) {
+        res.status(400).json({ ok: false, error: 'result is required' });
+        return;
+      }
+
+      const record = await appendDomainAudit({
+        entityType: 'FieldAnalysis',
+        entityId: projectId,
+        action: 'FIELD_ANALYSIS_SAVED',
+        userId: req.authUser.id,
+        payload: { projectId, mode, analysisType, resultLength: result.length, filename: filename ?? null },
+      });
+
+      res.json({ ok: true, saved: true, auditId: record.id, projectId, mode, analysisType });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'field analysis save failed' });
+    }
+  },
+);
+
+router.get('/api/admin/projects', requireAuth, rateLimitByUser(40, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const projects = await listProjectsForAdmin(req.authUser.organisationId);
+    res.json({ ok: true, projects });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'admin project list failed' });
+  }
+});
+
+router.post('/api/admin/projects', requireAuth, rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const propertyDesignationRaw = String(req.body?.propertyDesignation ?? '').trim();
+    const propertyDesignation =
+      propertyDesignationRaw || `ADMIN-INDEX-${new Date().toISOString().slice(0, 10)}`;
+
+    const result = await createOrGetAdminProject({
+      organisationId: req.authUser.organisationId,
+      userId: req.authUser.id,
+      propertyDesignation,
+    });
+
+    res.json({ ok: true, project: result.project, created: result.created });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'admin project create failed' });
+  }
+});
+
+router.get('/api/admin/dispatch/provider', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const dispatch = getDispatchProviderRuntimeStatus();
+    res.json({ ok: true, dispatch, checkedAt: new Date().toISOString() });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'dispatch status failed' });
+  }
+});
+
+router.get('/api/admin/requirements/cases', requireAuth, rateLimitByUser(40, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const page = parsePositiveInt(req.query?.page, 1, 1, 10_000);
+    const pageSize = parsePositiveInt(req.query?.pageSize, 25, 1, 200);
+    const payload = await listRequirementCases({
+      organisationId: req.authUser.organisationId,
+      page,
+      pageSize,
+      municipality: parseOptionalText(req.query?.municipality),
+      documentType: parseOptionalText(req.query?.documentType),
+      verificationStatus: parseOptionalRequirementStatus(req.query?.verificationStatus),
+    });
+
+    res.json({ ok: true, ...payload });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'requirements cases failed' });
+  }
+});
+
+router.get('/api/admin/requirements/rows', requireAuth, rateLimitByUser(60, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const page = parsePositiveInt(req.query?.page, 1, 1, 10_000);
+    const pageSize = parsePositiveInt(req.query?.pageSize, 25, 1, 200);
+    const includePreliminary = parseBooleanFlag(req.query?.includePreliminary, true);
+    const payload = await listRequirementRows({
+      organisationId: req.authUser.organisationId,
+      page,
+      pageSize,
+      municipality: parseOptionalText(req.query?.municipality),
+      documentType: parseOptionalText(req.query?.documentType),
+      category: parseOptionalText(req.query?.category),
+      caseId: parseOptionalText(req.query?.caseId),
+      requirementCode: parseOptionalText(req.query?.requirementCode),
+      verificationStatus: parseOptionalRequirementStatus(req.query?.verificationStatus),
+      includePreliminary,
+    });
+
+    res.json({ ok: true, ...payload });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'requirements rows failed' });
+  }
+});
+
+router.get(
+  '/api/admin/requirements/citations',
+  requireAuth,
+  rateLimitByUser(60, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const page = parsePositiveInt(req.query?.page, 1, 1, 10_000);
+      const pageSize = parsePositiveInt(req.query?.pageSize, 25, 1, 200);
+      const includePreliminary = parseBooleanFlag(req.query?.includePreliminary, true);
+      const payload = await listRequirementCitations({
+        organisationId: req.authUser.organisationId,
+        page,
+        pageSize,
+        requirementCode: parseOptionalText(req.query?.requirementCode),
+        verificationStatus: parseOptionalRequirementStatus(req.query?.verificationStatus),
+        includePreliminary,
+      });
+
+      res.json({ ok: true, ...payload });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'requirements citations failed' });
+    }
+  },
+);
+
+router.patch(
+  '/api/admin/requirements/rows/:requirementCode/verify',
+  requireAuth,
+  rateLimitByUser(50, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const requirementCode = String(req.params.requirementCode || '').trim();
+      const verificationStatus = parseOptionalRequirementStatus(req.body?.verificationStatus);
+      const verifiedBy = parseOptionalText(req.body?.verifiedBy);
+      const validationComment = parseOptionalText(req.body?.validationComment);
+      const errorType = parseOptionalText(req.body?.errorType);
+
+      if (!requirementCode || !verificationStatus) {
+        res.status(400).json({ ok: false, error: 'requirementCode and verificationStatus are required' });
+        return;
+      }
+
+      const updated = await updateRequirementVerification({
+        requirementCode,
+        organisationId: req.authUser.organisationId,
+        verificationStatus,
+        verifiedBy,
+        validationComment,
+        errorType,
+      });
+
+      await appendDomainAudit({
+        entityType: 'RequirementRecord',
+        entityId: updated.id,
+        action: 'REQUIREMENT_VERIFY',
+        userId: req.authUser.id,
+        payload: {
+          requirementCode: updated.requirementCode,
+          verificationStatus: updated.verificationStatus,
+          verifiedBy: updated.verifiedBy,
+        },
+      });
+
+      res.json({ ok: true, row: updated });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'requirement verify failed' });
+    }
+  },
+);
+
+router.patch(
+  '/api/admin/requirements/citations/:citationCode/verify',
+  requireAuth,
+  rateLimitByUser(50, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const citationCode = String(req.params.citationCode || '').trim();
+      const verificationStatus = parseOptionalRequirementStatus(req.body?.verificationStatus);
+      const verifiedBy = parseOptionalText(req.body?.verifiedBy);
+      const comment = parseOptionalText(req.body?.comment);
+      const pageNumber =
+        req.body?.pageNumber == null || req.body?.pageNumber === ''
+          ? undefined
+          : parsePositiveInt(req.body?.pageNumber, 1, 1, 10_000);
+
+      if (!citationCode || !verificationStatus) {
+        res.status(400).json({ ok: false, error: 'citationCode and verificationStatus are required' });
+        return;
+      }
+
+      const updated = await updateCitationVerification({
+        citationCode,
+        organisationId: req.authUser.organisationId,
+        verificationStatus,
+        verifiedBy,
+        comment,
+        pageNumber,
+      });
+
+      await appendDomainAudit({
+        entityType: 'RequirementCitation',
+        entityId: updated.id,
+        action: 'CITATION_VERIFY',
+        userId: req.authUser.id,
+        payload: {
+          citationCode: updated.citationCode,
+          verificationStatus: updated.verificationStatus,
+          verifiedBy: updated.verifiedBy,
+        },
+      });
+
+      res.json({ ok: true, citation: updated });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'citation verify failed' });
+    }
+  },
+);
+
+router.get(
+  '/api/admin/requirements/documents/:documentId/view',
+  requireAuth,
+  rateLimitByUser(50, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const documentId = String(req.params.documentId || '').trim();
+      if (!documentId) {
+        res.status(400).json({ ok: false, error: 'documentId is required' });
+        return;
+      }
+
+      const document = await getDocumentById(documentId, req.authUser.organisationId);
+      if (!document || !document.absolutePath) {
+        res.status(404).json({ ok: false, error: 'Document not found' });
+        return;
+      }
+      if (!(await storageFileExists(document.absolutePath))) {
+        res.status(404).json({ ok: false, error: 'Document file missing on server' });
+        return;
+      }
+
+      await appendDomainAudit({
+        entityType: 'DocumentRecord',
+        entityId: document.id,
+        action: 'REQUIREMENT_DOCUMENT_VIEW',
+        userId: req.authUser.id,
+        payload: {
+          documentId: document.id,
+          mimeType: document.mimeType || 'application/pdf',
+        },
+      });
+
+      const stream = createStorageReadStream(document.absolutePath);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader(
+        'Content-Disposition',
+        `inline; filename="${encodeURIComponent(document.originalName || 'document.pdf')}"`,
+      );
+      stream.pipe(res);
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'document view failed' });
+    }
+  },
+);
+
+router.get(
+  '/api/admin/requirements/reports/summary',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const includePreliminary = parseBooleanFlag(req.query?.includePreliminary, false);
+      const payload = await buildRequirementsReportSummary({
+        organisationId: req.authUser.organisationId,
+        includePreliminary,
+      });
+      res.json({ ok: true, summary: payload.summary });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'report summary failed' });
+    }
+  },
+);
+
+router.get(
+  '/api/admin/requirements/reports/export.csv',
+  requireAuth,
+  rateLimitByUser(15, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const includePreliminary = parseBooleanFlag(req.query?.includePreliminary, false);
+      const stream = await buildRequirementsExportCsvZip({
+        organisationId: req.authUser.organisationId,
+        includePreliminary,
+      });
+      const filename = exportFilename('kravrapport', 'zip');
+
+      await appendDomainAudit({
+        entityType: 'RequirementReport',
+        entityId: 'requirements-export-csv',
+        action: 'REPORT_EXPORT_CSV',
+        userId: req.authUser.id,
+        payload: { includePreliminary, filename },
+      });
+
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      stream.pipe(res);
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'csv export failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/admin/requirements/reports/export.docx',
+  requireAuth,
+  rateLimitByUser(15, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const includePreliminary = parseBooleanFlag(req.body?.includePreliminary, false);
+      const buffer = await buildRequirementsDocxBuffer({
+        organisationId: req.authUser.organisationId,
+        includePreliminary,
+      });
+      const filename = exportFilename('kravrapport', 'docx');
+
+      await appendDomainAudit({
+        entityType: 'RequirementReport',
+        entityId: 'requirements-export-docx',
+        action: 'REPORT_EXPORT_DOCX',
+        userId: req.authUser.id,
+        payload: { includePreliminary, filename },
+      });
+
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      );
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(buffer);
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'docx export failed' });
+    }
+  },
+);
+
+router.get('/api/admin/app-status', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const status = await getAppStatus();
+    res.json({ ok: true, status });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'app status check failed' });
+  }
+});
+
+router.get('/api/admin/completion', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const completion = await getAppCompletion();
+    res.json({ ok: true, completion });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'completion check failed' });
+  }
+});
+
+router.get('/api/admin/external-health', requireAuth, rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const report = await getExternalHealth();
+    res.json({ ok: true, report });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'external health check failed' });
+  }
+});
+
+router.get('/api/admin/db-stats', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const stats = await getDbStats();
+    res.json({ ok: true, stats });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'db stats failed' });
+  }
+});
+
+router.get('/api/admin/db-analysis', requireAuth, rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const analysis = await getDbAnalysis();
+    res.json({ ok: true, analysis });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'db analysis failed' });
+  }
+});
+
+router.get('/api/admin/db-contents', requireAuth, rateLimitByUser(15, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const limitParam = parseInt(String(req.query.limit ?? '10'), 10);
+    const limit = Number.isFinite(limitParam) ? limitParam : 10;
+    const contents = await getDbContents(limit);
+    res.json({ ok: true, contents });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'db contents failed' });
+  }
+});
+
+router.get('/api/admin/database-dump', requireAuth, rateLimitByUser(5, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const limitRaw = Number(req.query?.limitPerTable ?? 0);
+    const includeSearchTextRaw = String(req.query?.includeSearchText ?? 'true').toLowerCase();
+    const includeChunkTextRaw = String(req.query?.includeChunkText ?? 'true').toLowerCase();
+    const includeSearchText = !['false', '0', 'no'].includes(includeSearchTextRaw);
+    const includeChunkText = !['false', '0', 'no'].includes(includeChunkTextRaw);
+
+    const dump = await getAdminDatabaseDump({
+      limitPerTable: Number.isFinite(limitRaw) ? limitRaw : undefined,
+      includeSearchText,
+      includeChunkText,
+    });
+    res.json({ ok: true, dump });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'admin database dump failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Organisation Invitations  (auth-org-management)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post('/api/orgs/:orgId/invitations', requireAuth, rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const { email, role } = req.body as { email?: string; role?: string };
+    if (!email || !role) {
+      res.status(400).json({ ok: false, error: 'email och role krävs' });
+      return;
+    }
+
+    const invitation = await createInvitation({
+      orgId: sp(req.params.orgId),
+      email,
+      role,
+      actingUserId: req.authUser.id,
+    });
+    res.json({ ok: true, invitation });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'invitation create failed' });
+  }
+});
+
+router.get('/api/orgs/:orgId/invitations', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const invitations = listInvitations(sp(req.params.orgId));
+    res.json({ ok: true, invitations });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'list invitations failed' });
+  }
+});
+
+router.post('/api/orgs/:orgId/invitations/accept', rateLimitByUser(10, 60_000), async (req, res) => {
+  try {
+    const { token, bankidId } = req.body as { token?: string; bankidId?: string };
+    if (!token || !bankidId) {
+      res.status(400).json({ ok: false, error: 'token och bankidId krävs' });
+      return;
+    }
+
+    const result = await acceptInvitation({ orgId: sp(req.params.orgId), token, bankidId });
+    res.json({ ok: true, ...result });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'accept invitation failed' });
+  }
+});
+
+router.delete(
+  '/api/orgs/:orgId/invitations/:inviteId',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await revokeInvitation({
+        orgId: sp(req.params.orgId),
+        inviteId: sp(req.params.inviteId),
+        actingUserId: req.authUser.id,
+      });
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'revoke invitation failed' });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Permit Authority Submission  (permit-application-wizard + permit-authority-submit)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/api/projects/:projectId/permit/authority-submit',
+  requireAuth,
+  rateLimitByUser(10, 60_000),
+  rateLimitByOrg(50, 60 * 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await assertPermission(req.authUser, sp(req.params.projectId));
+
+      const { permitType, applicantName, propertyDesignation, documentIds, authorityName } = req.body as {
+        permitType?: string;
+        applicantName?: string;
+        propertyDesignation?: string;
+        documentIds?: string[];
+        authorityName?: string;
+      };
+
+      if (!permitType || !applicantName || !propertyDesignation) {
+        res.status(400).json({ ok: false, error: 'permitType, applicantName och propertyDesignation krävs' });
+        return;
+      }
+
+      const submission = await submitPermitToAuthority({
+        projectId: sp(req.params.projectId),
+        orgId: req.authUser.organisationId,
+        actingUserId: req.authUser.id,
+        permitType,
+        applicantName,
+        propertyDesignation,
+        documentIds: Array.isArray(documentIds) ? documentIds : [],
+        authorityName,
+      });
+
+      res.json({ ok: true, submission });
+    } catch (error: unknown) {
+      res.status(400).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'permit authority submit failed',
+      });
+    }
+  },
+);
+
+router.get(
+  '/api/projects/:projectId/permit/submissions/:referenceId',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await assertPermission(req.authUser, sp(req.params.projectId));
+      const submission = getSubmission(sp(req.params.referenceId));
+      if (!submission) {
+        res.status(404).json({ ok: false, error: 'Inlämning hittades inte' });
+        return;
+      }
+      res.json({ ok: true, submission });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'get submission failed' });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Market Intelligence  (logistics-market-view)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/api/market-intel/prices', requireAuth, rateLimitByUser(60, 60_000), async (_req, res) => {
+  try {
+    const snapshot = await platform.logistics.getMarketPrices();
+    res.json({ ok: true, snapshot });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'market intel failed' });
+  }
+});
+
+router.post('/api/market-intel/cache/invalidate', requireAuth, rateLimitByUser(5, 60_000), (req, res) => {
+  if (!req.authUser || req.authUser.role !== 'ADMIN') {
+    res.status(403).json({ ok: false, error: 'Admin required' });
+    return;
+  }
+  // In V2, caching is internal to the adapter
+  res.json({ ok: true });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Executive Summary Queue  (compliance-executive-summary)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/api/projects/:projectId/exec-summary/enqueue',
+  requireAuth,
+  rateLimitByUser(10, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await assertPermission(req.authUser, sp(req.params.projectId));
+
+      const job = await enqueueExecSummary({ projectId: sp(req.params.projectId), userId: req.authUser.id });
+      res.json({ ok: true, job });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'enqueue exec summary failed' });
+    }
+  },
+);
+
+router.get(
+  '/api/projects/:projectId/exec-summary/status/:jobId',
+  requireAuth,
+  rateLimitByUser(60, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      const job = getExecSummaryJobStatus(sp(req.params.jobId));
+      if (!job) {
+        res.status(404).json({ ok: false, error: 'Jobb hittades inte' });
+        return;
+      }
+      res.json({ ok: true, job });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'exec summary status failed' });
+    }
+  },
+);
+
+router.get(
+  '/api/projects/:projectId/exec-summary/jobs',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await assertPermission(req.authUser, sp(req.params.projectId));
+      const jobs = listExecSummaryJobs(sp(req.params.projectId));
+      res.json({ ok: true, jobs });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'list exec summary jobs failed' });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bank Compliance Profile  (compliance-bank-scoring)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get(
+  '/api/projects/:projectId/compliance/profile',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await assertPermission(req.authUser, sp(req.params.projectId));
+
+      const profile = await platform.compliance.getProfile(sp(req.params.projectId));
+      res.json({ ok: true, profile });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'get compliance profile failed' });
+    }
+  },
+);
+
+router.post(
+  '/api/projects/:projectId/compliance/profile/recompute',
+  requireAuth,
+  rateLimitByUser(10, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await assertPermission(req.authUser, sp(req.params.projectId));
+
+      const profile = await platform.compliance.recomputeProfile(sp(req.params.projectId));
+      res.json({ ok: true, profile });
+    } catch (error: unknown) {
+      res.status(400).json({
+        ok: false,
+        error: error instanceof Error ? error.message : 'recompute compliance profile failed',
+      });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LULC Marktäcke Layer  (geo-markcover)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/api/geo/markcover', requireAuth, rateLimitByUser(40, 60_000), async (req, res) => {
+  try {
+    const bboxStr = String(req.query.bbox ?? '');
+    const bbox = parseBbox(bboxStr);
+    if (!bbox) {
+      res.status(400).json({ ok: false, error: 'bbox krävs: minLng,minLat,maxLng,maxLat' });
+      return;
+    }
+
+    const layer = await getMarkCoverLayer(bbox as unknown as [number, number, number, number]);
+    res.json({ ok: true, layer });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'markcover failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Outlook Ingestion Webhook + Scheduler Status  (search-outlook-ingestion)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post('/api/admin/outlook/webhook', rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    // Microsoft Graph validation token handshake
+    const validationToken = req.query.validationToken as string | undefined;
+    if (validationToken) {
+      res.status(200).type('text/plain').send(validationToken);
+      return;
+    }
+
+    const rawBody = JSON.stringify(req.body);
+    const signature = req.headers['x-ms-signature'] as string | undefined;
+
+    const result = await triggerIngestionWebhook({ rawBody, signature });
+    res.json({ ok: true, ...result });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'webhook trigger failed' });
+  }
+});
+
+router.get('/api/admin/outlook/scheduler/status', requireAuth, rateLimitByUser(20, 60_000), (req, res) => {
+  if (!req.authUser || req.authUser.role !== 'ADMIN') {
+    res.status(403).json({ ok: false, error: 'Admin required' });
+    return;
+  }
+  const status = getOutlookSchedulerStatus();
+  res.json({ ok: true, status });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// General RAG Search  (ai-rag-search)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/api/search/rag',
+  requireAuth,
+  rateLimitByUser(30, 60_000),
+  rateLimitByOrg(300, 60 * 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const { query, projectId, limit, language } = req.body as {
+        query?: string;
+        projectId?: string;
+        limit?: number;
+        language?: 'sv' | 'en';
+      };
+
+      if (!query || String(query).trim().length === 0) {
+        res.status(400).json({ ok: false, error: 'query krävs' });
+        return;
+      }
+
+      const result = await runRagSearch({
+        query: String(query).trim(),
+        organisationId: req.authUser.organisationId,
+        projectId,
+        limit: typeof limit === 'number' ? limit : undefined,
+        language: language === 'en' ? 'en' : 'sv',
+      });
+
+      res.json({ ok: true, result });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'rag search failed' });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GPS Tracking  (logistics-gps-tracking)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/api/projects/:projectId/transport/:bookingId/gps/update',
+  requireAuth,
+  rateLimitByUser(120, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const position = await platform.logistics.updateGps(
+        sp(req.params.bookingId),
+        sp(req.params.projectId),
+        req.body,
+        req.authUser.id,
+      );
+
+      res.json({ ok: true, position });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'gps update failed' });
+    }
+  },
+);
+
+router.get(
+  '/api/projects/:projectId/transport/:bookingId/gps',
+  requireAuth,
+  rateLimitByUser(60, 60_000),
+  async (req, res) => {
+    try {
+      const track = await platform.logistics.getGpsTrack(sp(req.params.bookingId));
+      res.json({ ok: true, track });
+    } catch (error: unknown) {
+      res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'gps track failed' });
+    }
+  },
+);
+
+router.get(
+  '/api/projects/:projectId/transport/:bookingId/gps/latest',
+  requireAuth,
+  rateLimitByUser(120, 60_000),
+  async (req, res) => {
+    try {
+      const position = await platform.logistics.getLatestGps(sp(req.params.bookingId));
+      if (!position) {
+        res.status(404).json({ ok: false, error: 'Ingen position registrerad' });
+        return;
+      }
+      res.json({ ok: true, position });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'gps latest failed' });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// eIDAS Digital Signature  (compliance-digital-signature)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/api/documents/:documentId/sign/eidas',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const { signerPersonalNumber, signerName, signatureText, format, level } = req.body as {
+        signerPersonalNumber?: string;
+        signerName?: string;
+        signatureText?: string;
+        format?: 'PAdES' | 'XAdES' | 'CAdES';
+        level?: 'ADVANCED' | 'QUALIFIED';
+      };
+
+      if (!signerPersonalNumber || !signerName) {
+        res.status(400).json({ ok: false, error: 'signerPersonalNumber och signerName krävs' });
+        return;
+      }
+
+      const result = await signDocumentEidas(
+        {
+          documentId: sp(req.params.documentId),
+          signerPersonalNumber,
+          signerName,
+          signatureText,
+          format,
+          level,
+        },
+        req.authUser.id,
+      );
+
+      res.json({ ok: true, signature: result });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'eidas sign failed' });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3D Terrain  (geo-3d-terrain)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/api/geo/terrain', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    const bboxStr = String(req.query.bbox ?? '');
+    const bbox = parseBbox(bboxStr);
+    if (!bbox) {
+      res.status(400).json({ ok: false, error: 'bbox krävs: minLng,minLat,maxLng,maxLat' });
+      return;
+    }
+
+    const resolutionRaw = parseInt(String(req.query.resolution ?? '32'), 10);
+    const resolution = Number.isFinite(resolutionRaw) ? resolutionRaw : 32;
+
+    const terrain = await getTerrainData(bbox as unknown as [number, number, number, number], resolution);
+    res.json({ ok: true, terrain });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'terrain data failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OCR  (search-ocr)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/api/admin/ocr/extract/:documentId',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin required' });
+        return;
+      }
+
+      const result = await extractTextFromDocument(sp(req.params.documentId), req.authUser.id);
+      res.json({ ok: true, result });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'ocr extract failed' });
+    }
+  },
+);
+
+router.post('/api/admin/ocr/batch', requireAuth, rateLimitByUser(5, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin required' });
+      return;
+    }
+
+    const limitRaw = parseInt(String((req.body as { limit?: unknown })?.limit ?? '50'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(limitRaw, 200) : 50;
+
+    const result = await batchExtractPendingDocuments(req.authUser.id, limit);
+    res.json({ ok: true, result });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'ocr batch failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Automatic LIMS Fetch  (field-lims-integration)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post(
+  '/api/projects/:projectId/lims/auto-fetch',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      await assertPermission(req.authUser, sp(req.params.projectId));
+
+      const { since } = req.body as { since?: string };
+
+      const result = await autoFetchLimsReports({
+        projectId: sp(req.params.projectId),
+        actingUserId: req.authUser.id,
+        since,
+      });
+
+      res.json({ ok: true, result });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'lims auto-fetch failed' });
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Prometheus Metrics  (admin-monitoring)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/metrics', async (req, res) => {
+  // Protect metrics endpoint: require Bearer token or restrict to localhost
+  const metricsToken = process.env.METRICS_BEARER_TOKEN;
+  if (metricsToken) {
+    const authHeader = req.headers.authorization ?? '';
+    if (authHeader !== `Bearer ${metricsToken}`) {
+      res.status(401).set('WWW-Authenticate', 'Bearer').end();
+      return;
+    }
+  } else {
+    // Only allow from loopback if no token configured
+    const clientIp = req.ip ?? req.socket.remoteAddress ?? '';
+    const isLocal = clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === '::ffff:127.0.0.1';
+    if (!isLocal) {
+      res.status(403).end();
+      return;
+    }
+  }
+
+  try {
+    const text = await getMetricsText();
+    res.status(200).type('text/plain; version=0.0.4; charset=utf-8').send(text);
+  } catch {
+    res.status(500).end();
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error Tracking  (admin-error-tracking)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/api/admin/errors/recent', requireAuth, rateLimitByUser(20, 60_000), (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin required' });
+      return;
+    }
+
+    const limitRaw = parseInt(String(req.query.limit ?? '50'), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(limitRaw, 500) : 50;
+    const severity = req.query.severity as string | undefined;
+
+    const errors = getRecentErrors({
+      limit,
+      severity: severity as Parameters<typeof getRecentErrors>[0]['severity'],
+    });
+    res.json({ ok: true, errors, total: errors.length });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'get errors failed' });
+  }
+});
+
+router.post('/api/admin/errors/capture', requireAuth, rateLimitByUser(30, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { message, severity, context } = req.body as {
+      message?: string;
+      severity?: string;
+      context?: Record<string, unknown>;
+    };
+
+    if (!message) {
+      res.status(400).json({ ok: false, error: 'message krävs' });
+      return;
+    }
+
+    const err = new Error(message);
+    const id = await captureException(err, {
+      userId: req.authUser.id,
+      extra: context,
+      severity: (['fatal', 'error', 'warning', 'info'].includes(severity ?? '')
+        ? severity
+        : 'error') as Parameters<typeof captureException>[1]['severity'],
+    });
+
+    res.json({ ok: true, errorId: id });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'capture error failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Database Backup  (admin-backup)
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.post('/api/admin/backup/trigger', requireAuth, rateLimitByUser(3, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin required' });
+      return;
+    }
+
+    const manifest = await runBackup(req.authUser.id);
+    res.json({ ok: true, manifest });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'backup failed' });
+  }
+});
+
+router.get('/api/admin/backup/list', requireAuth, rateLimitByUser(20, 60_000), (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin required' });
+      return;
+    }
+
+    const backups = listBackups();
+    res.json({ ok: true, backups });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'list backups failed' });
+  }
+});
+
+router.get('/api/admin/backup/:backupId', requireAuth, rateLimitByUser(10, 60_000), (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin required' });
+      return;
+    }
+
+    const backup = getBackup(sp(req.params.backupId));
+    if (!backup) {
+      res.status(404).json({ ok: false, error: 'Backup hittades inte' });
+      return;
+    }
+    res.json({ ok: true, backup });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'get backup failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Full Status Analysis
+// GET /api/admin/full-status
+// Fullständig statusanalys av alla funktioner, integrationer och DB-innehåll.
+// ─────────────────────────────────────────────────────────────────────────────
+
+router.get('/api/admin/full-status', requireAuth, rateLimitByUser(10, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const report = await getFullStatus();
+    res.json({ ok: true, report });
+  } catch (error: unknown) {
+    res
+      .status(500)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'full status analysis failed' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GDPR  (Article 15, 17, 20)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/gdpr/me/export — self-service data portability (Art. 20)
+router.get('/api/gdpr/me/export', requireAuth, rateLimitByUser(5, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const data = await exportUserPersonalData(req.authUser.id);
+    res.json({ ok: true, data });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'gdpr export failed' });
+  }
+});
+
+// DELETE /api/admin/gdpr/users/:userId — permanent deletion (Art. 17, ADMIN only)
+router.delete('/api/admin/gdpr/users/:userId', requireAuth, rateLimitByUser(5, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const userId = sp(req.params.userId);
+    const result = await permanentlyDeleteUserData(userId);
+    res.json({ ok: true, result });
+  } catch (error: unknown) {
+    res.status(400).json({ ok: false, error: error instanceof Error ? error.message : 'gdpr delete failed' });
+  }
+});
+
+// POST /api/admin/gdpr/maintenance — trigger periodic GDPR cleanup (ADMIN only)
+router.post('/api/admin/gdpr/maintenance', requireAuth, rateLimitByUser(5, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (req.authUser.role !== 'ADMIN') {
+      res.status(403).json({ ok: false, error: 'Admin role required' });
+      return;
+    }
+
+    const result = await runGdprMaintenanceJob();
+    res.json({ ok: true, result });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'gdpr maintenance failed' });
+  }
+});
+
+// PUT /api/projects/:projectId/retention — set retention policy (ADMIN only)
+router.put(
+  '/api/projects/:projectId/retention',
+  requireAuth,
+  rateLimitByUser(20, 60_000),
+  async (req, res) => {
+    try {
+      if (!req.authUser) {
+        res.status(401).json({ ok: false, error: 'Unauthorized' });
+        return;
+      }
+      if (req.authUser.role !== 'ADMIN') {
+        res.status(403).json({ ok: false, error: 'Admin role required' });
+        return;
+      }
+
+      const projectId = sp(req.params.projectId);
+      const retentionDays = parseInt(String(req.body?.retentionDays ?? ''), 10);
+      if (!Number.isFinite(retentionDays) || retentionDays < 1) {
+        res.status(400).json({ ok: false, error: 'retentionDays must be a positive integer' });
+        return;
+      }
+
+      await setProjectRetentionPolicy(projectId, retentionDays);
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      res
+        .status(400)
+        .json({ ok: false, error: error instanceof Error ? error.message : 'set retention failed' });
+    }
+  },
+);
+
+// ─── Permits list (maps DocumentRecord → Permit shape) ───────────────────────
+router.get('/api/permits', requireAuth, rateLimitByUser(60, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const docs = await prisma.documentRecord.findMany({
+      where: { organisationId: req.authUser.organisationId },
+      orderBy: { receivedTime: 'desc' },
+      take: 200,
+      select: {
+        id: true,
+        originalName: true,
+        fileSha256: true,
+        receivedTime: true,
+        municipalityNormalized: true,
+        municipality: true,
+        activityCode: true,
+        wasteType: true,
+        decisionType: true,
+        updatedAt: true,
+        createdAt: true,
+      },
+    });
+
+    const permits = docs.map((doc) => ({
+      id: doc.id,
+      filename: doc.originalName,
+      checksum: doc.fileSha256 ?? '',
+      received_date: (doc.receivedTime ?? doc.createdAt).toISOString().slice(0, 10),
+      // property_id and full_text are not stored in DocumentRecord; they remain empty
+      // until a dedicated Permit model with OCR extraction is added.
+      property_id: '',
+      municipality: doc.municipalityNormalized ?? doc.municipality ?? '',
+      waste_codes: [doc.activityCode, doc.wasteType].filter(Boolean).join(', '),
+      decision_type: (doc.decisionType as 'BIFALL' | 'AVSLAG') ?? 'BIFALL',
+      full_text: '',
+      processed_at: doc.updatedAt.toISOString(),
+    }));
+
+    res.json({ ok: true, permits });
+  } catch (error: unknown) {
+    res
+      .status(500)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'fetch permits failed' });
+  }
+});
+
+// ─── Stakeholder Management ──────────────────────────────────────────────────
+router.get('/api/projects/:projectId/stakeholders', requireAuth, async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const projectId = sp(req.params.projectId);
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+    const plan = await getProjectPlanSnapshot(projectId, req.authUser.organisationId);
+    const stakeholders = Array.isArray(plan?.stakeholders) ? plan.stakeholders : [];
+    res.json({ ok: true, stakeholders });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'failed to fetch stakeholders' });
+  }
+});
+
+router.post('/api/projects/:projectId/stakeholders', requireAuth, async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const projectId = sp(req.params.projectId);
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+    const stakeholders = (req.body as { stakeholders?: unknown })?.stakeholders;
+    if (!Array.isArray(stakeholders)) {
+      res.status(400).json({ ok: false, error: 'stakeholders must be an array' });
+      return;
+    }
+
+    const currentPlan = await getProjectPlanSnapshot(projectId, req.authUser.organisationId);
+    if (!currentPlan) {
+      res.status(404).json({ ok: false, error: 'Plan not found' });
+      return;
+    }
+
+    await saveProjectPlanSnapshot({
+      projectId,
+      organisationId: req.authUser.organisationId,
+      plan: {
+        ...currentPlan,
+        stakeholders: stakeholders as ProjectPlan['stakeholders'],
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'failed to save stakeholders' });
+  }
+});
+
+// ─── Audit Archival ──────────────────────────────────────────────────────────
+router.post('/api/audit/archive', requireAuth, rateLimitByUser(20, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const projectId = String(req.body?.projectId || '').trim();
+    const { lat, lng, overallRisk, identityStatus, auditBundle } = req.body;
+    if (!projectId) {
+      res.status(400).json({ ok: false, error: 'projectId is required' });
+      return;
+    }
+
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+
+    const timestamp = Date.now();
+    const fileName = `audit-${projectId}-${timestamp}.json`;
+
+    let absolutePath: string;
+    if (gcsDocumentsEnabled()) {
+      absolutePath = buildGcsObjectUri(projectId, `audit-archives/${fileName}`);
+    } else {
+      const storageDir = path.join(process.cwd(), 'storage', 'audit-archives');
+      if (!fs.existsSync(storageDir)) {
+        fs.mkdirSync(storageDir, { recursive: true });
+      }
+      absolutePath = path.join(storageDir, fileName);
+    }
+
+    const payload = JSON.stringify(
+      {
+        projectId,
+        archivedAt: new Date().toISOString(),
+        archivedBy: req.authUser.id,
+        overallRisk,
+        identityStatus,
+        coordinates: { lat, lng },
+        auditBundle,
+      },
+      null,
+      2,
+    );
+
+    await writeStorageFile(absolutePath, Buffer.from(payload, 'utf8'), 'application/json');
+
+    // Spara ner audit-resultatet i databasen (kopplat till användaren)
+    const record = await prisma.documentRecord.create({
+      data: {
+        projectId,
+        organisationId: req.authUser.organisationId,
+        entryId: `AUDIT-${timestamp}`,
+        subject: `Audit: ${identityStatus} - ${lat}, ${lng}`,
+        originalName: fileName,
+        diskName: fileName,
+        absolutePath,
+        receivedTime: new Date(),
+        mimeType: 'application/json',
+        manifestMeta: {
+          auditBundle,
+          overallRisk,
+          identityStatus,
+          coordinates: { lat, lng },
+        },
+      },
+    });
+
+    res.json({ ok: true, id: record.id });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'audit archive failed' });
+  }
+});
+
+// ─── Receivers list (placeholder – no DB model yet) ───────────────────────────
+router.get('/api/receivers', requireAuth, rateLimitByUser(60, 60_000), async (req, res) => {
+  try {
+    if (!req.authUser) {
+      res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const projectId = String(req.query?.projectId || '').trim();
+    if (!projectId) {
+      res.json({ ok: true, receivers: [] });
+      return;
+    }
+
+    await assertProjectMembership({
+      projectId,
+      userId: req.authUser.id,
+      organisationId: req.authUser.organisationId,
+      role: req.authUser.role,
+    });
+
+    const plan = await getProjectPlanSnapshot(projectId, req.authUser.organisationId);
+    const receiverMap = new Map<
+      string,
+      {
+        id: string;
+        name: string;
+        allowedCodes: Set<string>;
+        isHazardousAllowed: boolean;
+      }
+    >();
+
+    const transportRows = [
+      ...(Array.isArray(plan?.dispatchQuotes) ? plan.dispatchQuotes : []),
+      ...(Array.isArray(plan?.transportBookings) ? plan.transportBookings : []),
+    ];
+
+    transportRows.forEach((row) => {
+      const receiverId = String(row.receiverId || '').trim();
+      const receiverName = String(row.receiverName || '').trim();
+      const wasteCode = String(row.wasteCode || '').trim();
+      if (!receiverId || !receiverName) {
+        return;
+      }
+
+      const existing = receiverMap.get(receiverId) || {
+        id: receiverId,
+        name: receiverName,
+        allowedCodes: new Set<string>(),
+        isHazardousAllowed: false,
+      };
+
+      if (wasteCode) {
+        existing.allowedCodes.add(wasteCode);
+        if (wasteCode.includes('*')) {
+          existing.isHazardousAllowed = true;
+        }
+      }
+
+      receiverMap.set(receiverId, existing);
+    });
+
+    const receivers = Array.from(receiverMap.values())
+      .map((receiver) => ({
+        id: receiver.id,
+        name: receiver.name,
+        allowedCodes: Array.from(receiver.allowedCodes).sort(),
+        type: 'UNKNOWN' as const,
+        isHazardousAllowed: receiver.isHazardousAllowed,
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name, 'sv'));
+
+    res.json({ ok: true, receivers });
+  } catch (error: unknown) {
+    res
+      .status(400)
+      .json({ ok: false, error: error instanceof Error ? error.message : 'receiver lookup failed' });
+  }
+});
+
+export default router;

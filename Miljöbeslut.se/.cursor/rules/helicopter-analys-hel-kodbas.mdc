@@ -1,0 +1,43 @@
+---
+description: När användaren vill ha övergripande totalanalys av hela eller stora delar av repot (arkitektur, risker, luckor).
+globs: []
+alwaysApply: false
+---
+
+# Helikopteranalys med största möjliga kontext
+
+## Varför inte “allt i ett enda Cursor‑fönster”?
+
+Saklig begränsning: även “stora” modeller har ett **hårt token‑tak**. En full produktionskodbas får sällan plats **ordagrant** i en chatt utan att trunkeras. Lösningen är **kombination**: indexerad sökning (RAG) i Cursor + vid behov **en exporterad helhetsdump** till ett verktyg med **mycket stort kontextfönster** (t.ex. Gemini 1.5 Pro ~2M tokens).
+
+## Nivå A – Cursor (daglig helikopter i praktiken)
+
+1. **Inställningar (gör en gång)**  
+   - `Settings → Features → Codebase indexing` → **Enable**  
+   - Välj en modell med **Large / Long context** eller **Max Mode** där det finns i din Cursor‑plan (modellnamn ändras; välj det största du har tillgång till).
+
+2. **Kontextflaggor** (minimera brus, maximera signal):  
+   - `@Codebase` för frågor om hela projektet.  
+   - Lägg till mappar vid behov: `@server`, `@prisma/schema.prisma`, `@AGENTS.md`, `@docs/architecture`.
+
+3. **Prompt** (exempel):  
+   - Be om *arkitekturöversikt*, *förtroendegränser*, *test/CI‑täckning*, *top 10 risker*, *rekommenderad roadmap* – **explicit** att svaret ska struktureras i rubriker och att osäkerheter ska nämnas.
+
+`.cursorignore` ska hålla **node_modules**, stora binärer och onödiga massfiler borta så indexet fokuserar på verklig kod (redan nämnt i `AGENTS.md`).
+
+## Nivå B – Största praktiska “hela repot” (2M‑klass)
+
+För **total** genomgång där du vill att modellen **läser nästan all källtext** i ett pass:
+
+1. I repo‑roten: `npx repomix` → skapar `repomix-output.xml` (gitignoreras enligt projektkonvention).  
+2. Ladda upp filen i **Google AI Studio** med **Gemini 1.5 Pro** (eller nyare motsvarighet med stort fönster).  
+3. Använd promptmallen: `docs/templates/context-dump-prompt.md` (fyra delar: täckning, styrkor, risker, rekommendationer).  
+4. Resultatet är **analys och slutsatser** – implementation ska sedan gå via er ordinarie kodväg (t.ex. Copilot Agent / PR), inte direkt från AI Studio.
+
+## Värdering och slutsats
+
+- Kräv **separerade** block: fakta (vad koden gör) vs **bedömning** (risk, skuld, prioritering).  
+- Be om **“sak som saknas i underlaget”** om dumpen är trunkerad eller vissa sökvägar excludats.  
+- Följ **human in the loop**: godkänn aldrig stor refaktor eller säkerhetsbeslut enbart på auto‑analys.
+
+Mer bakgrund: `docs/architecture/ai-model-selection.md` och tabellen i `AGENTS.md` under *AI-modellval*.
